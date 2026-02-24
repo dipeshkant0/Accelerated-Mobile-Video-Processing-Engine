@@ -57,7 +57,6 @@ class MainActivity : AppCompatActivity() {
             {
             val cameraProvider = cameraProviderFuture.get()
 
-            // 1. Define Image Analysis (We skip 'Preview' entirely)
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 // Force 720p or 1080p for a sharper look
