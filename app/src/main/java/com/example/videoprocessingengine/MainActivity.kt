@@ -23,6 +23,10 @@ class MainActivity : AppCompatActivity() {
     private var lastFrameTimestamp = 0L
     private var frameCount = 0
     private var fps = 0.0
+    private var cpuUsage = 0.0
+    private var memoryUsage = 0
+    private var lastCpuTime = 0L
+    private var lastRealTime = 0L
     private lateinit var cameraExecutor: ExecutorService
 
     // This is your bridge to the C++ frame processor
@@ -60,15 +64,42 @@ class MainActivity : AppCompatActivity() {
                 .setTargetResolution(android.util.Size(1280, 720))
                 .build()
 
-            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                val width = imageProxy.width
-                val height = imageProxy.height
-                val currentTimestamp = System.currentTimeMillis()
-                if (currentTimestamp - lastFrameTimestamp >= 1000) {
-                    fps = (frameCount * 1000.0) / (currentTimestamp - lastFrameTimestamp)
-                    lastFrameTimestamp = currentTimestamp
-                    frameCount = 0
-                }
+                imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                    val width = imageProxy.width
+                    val height = imageProxy.height
+
+                    val currentTimestamp = System.currentTimeMillis()
+                    val currentCpuTime = android.os.Debug.threadCpuTimeNanos()
+
+                    if (lastRealTime == 0L) {
+                        lastRealTime = currentTimestamp
+                        lastCpuTime = currentCpuTime
+                        lastFrameTimestamp = currentTimestamp
+                    }
+
+                    if (currentTimestamp - lastFrameTimestamp >= 1000) {
+                        val timeInterval = currentTimestamp - lastFrameTimestamp
+
+                        fps = (frameCount * 1000.0) / timeInterval
+
+                        val cpuDiff = currentCpuTime - lastCpuTime
+                        val realDiff = timeInterval * 1_000_000L
+                        cpuUsage = (cpuDiff.toDouble() / realDiff.toDouble()) * 100.0
+
+                        val memInfo = android.app.ActivityManager.MemoryInfo()
+                        val actManager = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
+                        actManager.getMemoryInfo(memInfo)
+                        val pid = android.os.Process.myPid()
+                        val processMemoryInfo = actManager.getProcessMemoryInfo(intArrayOf(pid))[0]
+                        memoryUsage = processMemoryInfo.totalPss / 1024
+
+                        frameCount = 0
+                        lastFrameTimestamp = currentTimestamp
+                        lastCpuTime = currentCpuTime
+                        lastRealTime = currentTimestamp
+                    }
+
+
                 if (rgbaBuffer == null) {
                     rgbaBuffer = ByteBuffer.allocateDirect(width * height * 4)
                 }
@@ -90,8 +121,8 @@ class MainActivity : AppCompatActivity() {
 
                 runOnUiThread {
                     binding.processedImageView.setImageBitmap(bitmap)
-                    frameCount++
-                    binding.latencyText.text = String.format("---- Baseline ----\nLatency: %.2f ms\nFPS: %.2f", latency,fps)
+                    frameCount++ // Increment after successful display
+                    binding.latencyText.text = String.format("---- Baseline ----\nLatency: %.2f ms\nFPS: %.2f\nCPU: %.1f%%\nMemory Usage: %d MB", latency, fps, cpuUsage, memoryUsage)
                 }
                 imageProxy.close()
             }
