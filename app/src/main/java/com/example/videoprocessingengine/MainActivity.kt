@@ -1,9 +1,12 @@
 package com.example.videoprocessingengine
 
 import android.Manifest
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.os.BatteryManager
 import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
 import androidx.activity.result.contract.ActivityResultContracts
@@ -29,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private var memoryUsage = 0
     private var lastCpuTime = 0L
     private var lastRealTime = 0L
+    private var tempInCelsius = 0.0
 
     enum class ProcessingMode { BASELINE, SIMD, GPU, HYBRID }
     private var currentMode = ProcessingMode.BASELINE
@@ -105,6 +109,12 @@ class MainActivity : AppCompatActivity() {
                 val width = imageProxy.width
                 val height = imageProxy.height
 
+                //Fetch Temperature
+                val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+                val batteryStatus = registerReceiver(null, intentFilter)
+                val temp = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+                tempInCelsius = temp / 10.0
+
                 val currentTimestamp = System.currentTimeMillis()
                 val currentCpuTime = android.os.Debug.threadCpuTimeNanos()
 
@@ -123,12 +133,12 @@ class MainActivity : AppCompatActivity() {
                     val realDiff = timeInterval * 1_000_000L
                     cpuUsage = (cpuDiff.toDouble() / realDiff.toDouble()) * 100.0
 
+                    // Fetch Memory data
                     val memInfo = android.app.ActivityManager.MemoryInfo()
                     val actManager = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
                     actManager.getMemoryInfo(memInfo)
                     val pid = android.os.Process.myPid()
                     val processMemoryInfo = actManager.getProcessMemoryInfo(intArrayOf(pid))[0]
-                    
                     memoryUsage = processMemoryInfo.totalPss / 1024
 
                     frameCount = 0
@@ -152,19 +162,23 @@ class MainActivity : AppCompatActivity() {
                     imageProxy.planes[1].rowStride,
                     imageProxy.planes[1].pixelStride
                 )
-
                 rgbaBuffer!!.rewind()
+
                 val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                 bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
 
-//                val matrix = Matrix().apply{ postRotate(90F)}
-//                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-
                 runOnUiThread {
-
+                    // render Frame
+                    binding.processedImageView.rotation = 90f
                     binding.processedImageView.setImageBitmap(bitmap)
                     frameCount++
-                    binding.latencyText.text = String.format("---- Baseline ----\nResolution: %d\n Latency: %.2f ms\nFPS: %.2f\nCPU: %.1f%%\nMemory Usage: %d MB",targetHeight,latency, fps, cpuUsage, memoryUsage)
+                    //update data
+                    binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"
+                    binding.latencyVal.text = String.format("LAT: %.1f ms", latency)
+                    binding.fpsVal.text = String.format("FPS: %.1f", fps)
+                    binding.cpuVal.text = String.format("CPU: %.0f%%", cpuUsage)
+                    binding.memVal.text = "MEM: ${memoryUsage}MB"
+                    binding.tempVal.text = String.format("THERMAL: %.1f°C", tempInCelsius)
                 }
                 imageProxy.close()
             }

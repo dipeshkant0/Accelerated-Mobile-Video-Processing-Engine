@@ -3,26 +3,93 @@
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <androidx.cardview.widget.CardView
+        android:id="@+id/dashboardCard"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="16dp"
+        app:cardBackgroundColor="#CC222222"
+        app:cardCornerRadius="12dp"
+        app:cardElevation="8dp"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <GridLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:columnCount="2"
+            android:padding="16dp"
+            android:rowCount="3">
+
+            <TextView
+                android:id="@+id/modeLabel"
+                android:layout_columnSpan="2"
+                android:layout_marginBottom="8dp"
+                android:fontFamily="monospace"
+                android:text="MODE: BASELINE | RES: 720p"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/latencyVal"
+                android:layout_width="0dp"
+                android:layout_columnWeight="1"
+                android:fontFamily="monospace"
+                android:text="LAT: 0.0 ms"
+                android:textColor="#00FF00"
+                android:textSize="18sp" />
+
+            <TextView
+                android:id="@+id/fpsVal"
+                android:layout_width="0dp"
+                android:layout_columnWeight="1"
+                android:fontFamily="monospace"
+                android:text="FPS: 0"
+                android:textColor="#00FF00"
+                android:textSize="18sp" />
+
+            <TextView
+                android:id="@+id/cpuVal"
+                android:layout_width="0dp"
+                android:layout_columnWeight="1"
+                android:layout_marginTop="4dp"
+                android:fontFamily="monospace"
+                android:text="CPU: 0%"
+                android:textColor="#FFCC00"
+                android:textSize="16sp" />
+
+            <TextView
+                android:id="@+id/memVal"
+                android:layout_width="0dp"
+                android:layout_columnWeight="1"
+                android:layout_marginTop="4dp"
+                android:fontFamily="monospace"
+                android:text="MEM: 0 MB"
+                android:textColor="#66CCFF"
+                android:textSize="16sp" />
+
+            <TextView
+                android:id="@+id/tempVal"
+                android:layout_columnSpan="2"
+                android:layout_marginTop="8dp"
+                android:fontFamily="monospace"
+                android:text="THERMAL: 0°C"
+                android:textColor="#FF4444"
+                android:textSize="14sp" />
+        </GridLayout>
+    </androidx.cardview.widget.CardView>
 
     <ImageView
         android:id="@+id/processedImageView"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:scaleType="centerCrop"/>
-
-    <TextView
-        android:id="@+id/latencyText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="---- Baseline ----"
-        android:textColor="#00FF00"
-        android:textSize="18sp"
-        android:background="#80000000"
-        android:padding="8dp"
-        app:layout_constraintTop_toTopOf="parent"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:scaleType="centerCrop"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        android:layout_margin="16dp" />
-
+        app:layout_constraintTop_toBottomOf="@id/dashboardCard" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
