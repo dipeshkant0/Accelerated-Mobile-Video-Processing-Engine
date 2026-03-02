@@ -39,6 +39,7 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNative(
             int g = Y - ((U * 352 + V * 731) >> 10);
             int b = Y + ((U * 1814) >> 10);
 
+
             // ABGR format for Android Bitmaps (Little Endian)
             rgbaRow[x] = (0xFF << 24) | (clamp_int(b) << 16) | (clamp_int(g) << 8) | clamp_int(r);
         }
