@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+<item android:title="Select Mode">
+    <menu>
+        <group android:id="@+id/mode_group" android:checkableBehavior="single">
+            <item
+                android:id="@+id/mode_baseline"
+                android:title="Baseline (Scalar)"
+                android:checked="true" /> <item
+            android:id="@+id/mode_simd"
+            android:title="SIMD (NEON)" />
+            <item
+                android:id="@+id/mode_gpu"
+                android:title="GPU (OpenCL)" />
+        </group>
+    </menu>
+</item>
+
+<item android:title="Resolution">
+    <menu>
+        <group android:id="@+id/res_group" android:checkableBehavior="single">
+            <item
+                android:id="@+id/res_720p"
+                android:title="1280x720 (HD)"
+                android:checked="true" />
+            <item
+                android:id="@+id/res_1080p"
+                android:title="1920x1080 (FHD)" />
+        </group>
+    </menu>
+</item>
+</menu>

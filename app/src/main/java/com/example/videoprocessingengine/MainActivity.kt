@@ -1,8 +1,12 @@
 package com.example.videoprocessingengine
 
 import android.Manifest
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.os.BatteryManager
 import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
 import androidx.activity.result.contract.ActivityResultContracts
@@ -15,6 +19,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import android.util.Log
+import android.util.Size
 
 
 class MainActivity : AppCompatActivity() {
@@ -27,10 +32,15 @@ class MainActivity : AppCompatActivity() {
     private var memoryUsage = 0
     private var lastCpuTime = 0L
     private var lastRealTime = 0L
+    private var tempInCelsius = 0.0
+
+    enum class ProcessingMode { BASELINE, SIMD, GPU, HYBRID }
+    private var currentMode = ProcessingMode.BASELINE
+    private var targetWidth = 1280
+    private var targetHeight = 720
     private lateinit var cameraExecutor: ExecutorService
 
-    // This is your bridge to the C++ frame processor
-    // 1. Update the declaration to match your 10-argument call
+    // frame processing function in c++
     external fun processFrameNative(
         y: ByteBuffer, u: ByteBuffer, v: ByteBuffer,
         rgba: ByteBuffer, width: Int, height: Int,
@@ -50,57 +60,95 @@ class MainActivity : AppCompatActivity() {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
     }
+    override fun onCreateOptionsMenu(menu: android.view.Menu): Boolean {
+        menuInflater.inflate(R.menu.main_menu, menu)
+        return true
+    }
 
+    // Handle menu clicks
+    override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean {
+          item.isChecked = true
+
+        when (item.itemId) {
+            R.id.mode_baseline -> {
+                currentMode = ProcessingMode.BASELINE
+            }
+            R.id.mode_simd -> {
+                currentMode = ProcessingMode.SIMD
+            }
+            R.id.res_720p -> {
+                targetWidth = 1280
+                targetHeight = 720
+                restartCamera()
+            }
+            R.id.res_1080p -> {
+                targetWidth = 1920
+                targetHeight = 1080
+                restartCamera()
+            }
+        }
+        return true
+    }
+
+    private fun restartCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.get().unbindAll()
+        startCamera()
+    }
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener(
-            {
+        cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-
-            // 1. Define Image Analysis (We skip 'Preview' entirely)
+                
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                // Force 720p or 1080p for a sharper look
-                .setTargetResolution(android.util.Size(1280, 720))
+                .setTargetResolution(Size(targetWidth, targetHeight))
                 .build()
 
-                imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                    val width = imageProxy.width
-                    val height = imageProxy.height
+            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                val width = imageProxy.width
+                val height = imageProxy.height
 
-                    val currentTimestamp = System.currentTimeMillis()
-                    val currentCpuTime = android.os.Debug.threadCpuTimeNanos()
+                //Fetch Temperature
+                val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+                val batteryStatus = registerReceiver(null, intentFilter)
+                val temp = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+                tempInCelsius = temp / 10.0
 
-                    if (lastRealTime == 0L) {
-                        lastRealTime = currentTimestamp
-                        lastCpuTime = currentCpuTime
-                        lastFrameTimestamp = currentTimestamp
-                    }
+                val currentTimestamp = System.currentTimeMillis()
+                val currentCpuTime = android.os.Debug.threadCpuTimeNanos()
 
-                    if (currentTimestamp - lastFrameTimestamp >= 1000) {
-                        val timeInterval = currentTimestamp - lastFrameTimestamp
+                if (lastRealTime == 0L) {
+                    lastRealTime = currentTimestamp
+                    lastCpuTime = currentCpuTime
+                    lastFrameTimestamp = currentTimestamp
+                }
 
-                        fps = (frameCount * 1000.0) / timeInterval
+                if (currentTimestamp - lastFrameTimestamp >= 1000) {
+                    val timeInterval = currentTimestamp - lastFrameTimestamp
 
-                        val cpuDiff = currentCpuTime - lastCpuTime
-                        val realDiff = timeInterval * 1_000_000L
-                        cpuUsage = (cpuDiff.toDouble() / realDiff.toDouble()) * 100.0
+                    fps = (frameCount * 1000.0) / timeInterval
 
-                        val memInfo = android.app.ActivityManager.MemoryInfo()
-                        val actManager = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
-                        actManager.getMemoryInfo(memInfo)
-                        val pid = android.os.Process.myPid()
-                        val processMemoryInfo = actManager.getProcessMemoryInfo(intArrayOf(pid))[0]
-                        memoryUsage = processMemoryInfo.totalPss / 1024
+                    val cpuDiff = currentCpuTime - lastCpuTime
+                    val realDiff = timeInterval * 1_000_000L
+                    cpuUsage = (cpuDiff.toDouble() / realDiff.toDouble()) * 100.0
 
-                        frameCount = 0
-                        lastFrameTimestamp = currentTimestamp
-                        lastCpuTime = currentCpuTime
-                        lastRealTime = currentTimestamp
-                    }
+                    // Fetch Memory data
+                    val memInfo = android.app.ActivityManager.MemoryInfo()
+                    val actManager = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
+                    actManager.getMemoryInfo(memInfo)
+                    val pid = android.os.Process.myPid()
+                    val processMemoryInfo = actManager.getProcessMemoryInfo(intArrayOf(pid))[0]
+                    memoryUsage = processMemoryInfo.totalPss / 1024
+
+                    frameCount = 0
+                    lastFrameTimestamp = currentTimestamp
+                    lastCpuTime = currentCpuTime
+                    lastRealTime = currentTimestamp
+                }
 
 
-                if (rgbaBuffer == null) {
+                if (rgbaBuffer == null || rgbaBuffer!!.capacity() < width * height * 4) {
                     rgbaBuffer = ByteBuffer.allocateDirect(width * height * 4)
                 }
                 val latency = processFrameNative(
@@ -111,25 +159,32 @@ class MainActivity : AppCompatActivity() {
                     width,
                     height,
                     imageProxy.planes[0].rowStride,
-                    imageProxy.planes[1].rowStride, // Both U and V use this
+                    imageProxy.planes[1].rowStride,
                     imageProxy.planes[1].pixelStride
                 )
-
                 rgbaBuffer!!.rewind()
+
                 val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                 bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
 
                 runOnUiThread {
+                    // render Frame
+                    binding.processedImageView.rotation = 90f
                     binding.processedImageView.setImageBitmap(bitmap)
-                    frameCount++ // Increment after successful display
-                    binding.latencyText.text = String.format("---- Baseline ----\nLatency: %.2f ms\nFPS: %.2f\nCPU: %.1f%%\nMemory Usage: %d MB", latency, fps, cpuUsage, memoryUsage)
+                    frameCount++
+                    //update data
+                    binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"
+                    binding.latencyVal.text = String.format("LAT: %.1f ms", latency)
+                    binding.fpsVal.text = String.format("FPS: %.1f", fps)
+                    binding.cpuVal.text = String.format("CPU: %.0f%%", cpuUsage)
+                    binding.memVal.text = "MEM: ${memoryUsage}MB"
+                    binding.tempVal.text = String.format("THERMAL: %.1f°C", tempInCelsius)
                 }
                 imageProxy.close()
             }
 
             try {
                 cameraProvider.unbindAll()
-                // 5. Bind ONLY imageAnalysis
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, imageAnalysis)
             } catch (exc: Exception) {
                 Log.e("CameraApp", "Binding failed", exc)
