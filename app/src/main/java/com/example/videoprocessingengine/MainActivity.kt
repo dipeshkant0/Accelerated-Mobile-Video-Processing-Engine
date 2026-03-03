@@ -157,17 +157,63 @@ class MainActivity : AppCompatActivity() {
                 if (rgbaBuffer == null || rgbaBuffer!!.capacity() < width * height * 4) {
                     rgbaBuffer = ByteBuffer.allocateDirect(width * height * 4)
                 }
-                val latency = processFrameNative(
-                    imageProxy.planes[0].buffer,
-                    imageProxy.planes[1].buffer,
-                    imageProxy.planes[2].buffer,
-                    rgbaBuffer!!,
-                    width,
-                    height,
-                    imageProxy.planes[0].rowStride,
-                    imageProxy.planes[1].rowStride,
-                    imageProxy.planes[1].pixelStride
-                )
+
+                val latency = if(currentMode == ProcessingMode.SIMD)
+                {
+                    processFrameNativeSIMD(
+                        imageProxy.planes[0].buffer,
+                        imageProxy.planes[1].buffer,
+                        imageProxy.planes[2].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride,
+                        imageProxy.planes[1].rowStride,
+                        imageProxy.planes[1].pixelStride
+                    )
+                }
+                else if (currentMode == ProcessingMode.BASELINE)
+                {
+                    processFrameNative(
+                        imageProxy.planes[0].buffer,
+                        imageProxy.planes[1].buffer,
+                        imageProxy.planes[2].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride,
+                        imageProxy.planes[1].rowStride,
+                        imageProxy.planes[1].pixelStride
+                    )
+                }
+                else if(currentMode == ProcessingMode.GPU)
+                {
+                    processFrameNative(
+                        imageProxy.planes[0].buffer,
+                        imageProxy.planes[1].buffer,
+                        imageProxy.planes[2].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride,
+                        imageProxy.planes[1].rowStride,
+                        imageProxy.planes[1].pixelStride
+                    )
+                }
+                else{
+                    processFrameNative(
+                        imageProxy.planes[0].buffer,
+                        imageProxy.planes[1].buffer,
+                        imageProxy.planes[2].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride,
+                        imageProxy.planes[1].rowStride,
+                        imageProxy.planes[1].pixelStride
+                    )
+                }
+
                 rgbaBuffer!!.rewind()
 
                 val bitmap = createBitmap(width, height)
