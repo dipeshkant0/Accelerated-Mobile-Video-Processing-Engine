@@ -20,6 +20,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import android.util.Log
 import android.util.Size
+import androidx.core.graphics.createBitmap
 
 
 class MainActivity : AppCompatActivity() {
@@ -42,6 +43,11 @@ class MainActivity : AppCompatActivity() {
 
     // frame processing function in c++
     external fun processFrameNative(
+        y: ByteBuffer, u: ByteBuffer, v: ByteBuffer,
+        rgba: ByteBuffer, width: Int, height: Int,
+        yStride: Int, uvRowStride: Int, uvPixelStride: Int
+    ): Double
+    external fun processFrameNativeSIMD(
         y: ByteBuffer, u: ByteBuffer, v: ByteBuffer,
         rgba: ByteBuffer, width: Int, height: Int,
         yStride: Int, uvRowStride: Int, uvPixelStride: Int
@@ -164,7 +170,7 @@ class MainActivity : AppCompatActivity() {
                 )
                 rgbaBuffer!!.rewind()
 
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val bitmap = createBitmap(width, height)
                 bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
 
                 runOnUiThread {
