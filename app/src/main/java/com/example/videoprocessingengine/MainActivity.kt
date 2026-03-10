@@ -20,6 +20,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import android.util.Log
 import android.util.Size
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.core.graphics.createBitmap
 
 
@@ -108,7 +110,17 @@ class MainActivity : AppCompatActivity() {
                 
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setTargetResolution(Size(targetWidth, targetHeight))
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                Size(targetWidth, targetHeight),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                            )
+                        )
+                        .build()
+                )
+
                 .build()
 
             imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
@@ -216,13 +228,20 @@ class MainActivity : AppCompatActivity() {
 
                 rgbaBuffer!!.rewind()
 
+//                val bitmap = createBitmap(width, height)
+//                bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
                 val bitmap = createBitmap(width, height)
                 bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
 
+                val matrix = Matrix().apply { postRotate(90f) }
+                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, false)
+
+
                 runOnUiThread {
                     // render Frame
-                    binding.processedImageView.rotation = 90f
-                    binding.processedImageView.setImageBitmap(bitmap)
+//                    binding.processedImageView.rotation = 90f
+                    binding.processedImageView.setImageBitmap(rotatedBitmap)
+//                    binding.processedImageView.setImageBitmap(bitmap)
                     frameCount++
                     //update data
                     binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"
