@@ -42,18 +42,10 @@ class MainActivity : AppCompatActivity() {
     private var targetWidth = 1280
     private var targetHeight = 720
     private lateinit var cameraExecutor: ExecutorService
-
+    
     // frame processing function in c++
-    external fun processFrameNative(
-        y: ByteBuffer, u: ByteBuffer, v: ByteBuffer,
-        rgba: ByteBuffer, width: Int, height: Int,
-        yStride: Int, uvRowStride: Int, uvPixelStride: Int
-    ): Double
-    external fun processFrameNativeSIMD(
-        y: ByteBuffer, u: ByteBuffer, v: ByteBuffer,
-        rgba: ByteBuffer, width: Int, height: Int,
-        yStride: Int, uvRowStride: Int, uvPixelStride: Int
-    ): Double
+    external fun processFrameNative(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int): Double
+    external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int): Double
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,6 +102,7 @@ class MainActivity : AppCompatActivity() {
                 
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
                         .setResolutionStrategy(
@@ -174,62 +167,44 @@ class MainActivity : AppCompatActivity() {
                 {
                     processFrameNativeSIMD(
                         imageProxy.planes[0].buffer,
-                        imageProxy.planes[1].buffer,
-                        imageProxy.planes[2].buffer,
                         rgbaBuffer!!,
                         width,
                         height,
-                        imageProxy.planes[0].rowStride,
-                        imageProxy.planes[1].rowStride,
-                        imageProxy.planes[1].pixelStride
+                        imageProxy.planes[0].rowStride
                     )
                 }
                 else if (currentMode == ProcessingMode.BASELINE)
                 {
                     processFrameNative(
                         imageProxy.planes[0].buffer,
-                        imageProxy.planes[1].buffer,
-                        imageProxy.planes[2].buffer,
                         rgbaBuffer!!,
                         width,
                         height,
-                        imageProxy.planes[0].rowStride,
-                        imageProxy.planes[1].rowStride,
-                        imageProxy.planes[1].pixelStride
+                        imageProxy.planes[0].rowStride
                     )
                 }
                 else if(currentMode == ProcessingMode.GPU)
                 {
                     processFrameNative(
                         imageProxy.planes[0].buffer,
-                        imageProxy.planes[1].buffer,
-                        imageProxy.planes[2].buffer,
                         rgbaBuffer!!,
                         width,
                         height,
-                        imageProxy.planes[0].rowStride,
-                        imageProxy.planes[1].rowStride,
-                        imageProxy.planes[1].pixelStride
+                        imageProxy.planes[0].rowStride
                     )
                 }
                 else{
                     processFrameNative(
                         imageProxy.planes[0].buffer,
-                        imageProxy.planes[1].buffer,
-                        imageProxy.planes[2].buffer,
                         rgbaBuffer!!,
                         width,
                         height,
-                        imageProxy.planes[0].rowStride,
-                        imageProxy.planes[1].rowStride,
-                        imageProxy.planes[1].pixelStride
+                        imageProxy.planes[0].rowStride
                     )
                 }
 
                 rgbaBuffer!!.rewind()
 
-//                val bitmap = createBitmap(width, height)
-//                bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
                 val bitmap = createBitmap(width, height)
                 bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
 
@@ -239,9 +214,7 @@ class MainActivity : AppCompatActivity() {
 
                 runOnUiThread {
                     // render Frame
-//                    binding.processedImageView.rotation = 90f
                     binding.processedImageView.setImageBitmap(rotatedBitmap)
-//                    binding.processedImageView.setImageBitmap(bitmap)
                     frameCount++
                     //update data
                     binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"

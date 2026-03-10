@@ -4,46 +4,36 @@
 #include <algorithm>
 #include <arm_neon.h>
 
-// Faster integer-based clamp
-inline uint8_t clamp_int(int val) {
-    return (uint8_t)((val > 255) ? 255 : (val < 0 ? 0 : val));
-}
 
 extern "C" JNIEXPORT jdouble JNICALL
-Java_com_example_videoprocessingengine_MainActivity_processFrameNative(
-        JNIEnv* env, jobject, jobject yBuf, jobject uBuf, jobject vBuf,
-        jobject rgbaBuf, jint width, jint height,
-        jint yStride, jint uvRowStride, jint uvPixelStride) {
-
+Java_com_example_videoprocessingengine_MainActivity_processFrameNative(JNIEnv* env, jobject,
+                                jobject inRgbaBuf, jobject outRgbaBuf,
+                                jint width, jint height, jint rowStride)
+{
     auto start = std::chrono::high_resolution_clock::now();
 
-    auto* yData = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuf));
-    auto* uData = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuf));
-    auto* vData = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuf));
-    auto* rgbaData = static_cast<uint32_t*>(env->GetDirectBufferAddress(rgbaBuf));
+    auto* inData = static_cast<uint8_t*>(env->GetDirectBufferAddress(inRgbaBuf));
+    auto* outData = static_cast<uint8_t*>(env->GetDirectBufferAddress(outRgbaBuf));
 
+    // The output buffer is simply width * height * 4 (RGBA)
+    // The input buffer might have some row padding, so we copy row by row
     for (int y = 0; y < height; y++) {
-        uint32_t* rgbaRow = rgbaData + (y * width);
-        uint8_t* yRow = yData + (y * yStride);
+        uint8_t* inRow = inData + (y * rowStride);
+        uint8_t* outRow = outData + (y * width * 4);
+        
+        // Copy 4 bytes per pixel (RGBA)
+        std::copy(inRow, inRow + (width * 4), outRow);
+        for(int pos = 0;pos<width;pos+=4)
+        {
+            uint8_t r = inRow[pos];
+            uint8_t g = inRow[pos+1];
+            uint8_t b = inRow[pos+2];
+            uint8_t a = inRow[pos+3];
 
-        // Optimization: Pre-calculate the UV row start
-        uint8_t* uRow = uData + (y / 2) * uvRowStride;
-        uint8_t* vRow = vData + (y / 2) * uvRowStride;
-
-        for (int x = 0; x < width; x++) {
-            int Y = yRow[x];
-            int uvIdx = (x / 2) * uvPixelStride;
-            int U = uRow[uvIdx] - 128;
-            int V = vRow[uvIdx] - 128;
-
-            // Formulas based on standard YUV conversion constants
-            int r = Y + ((V * 1436) >> 10);
-            int g = Y - ((U * 352 + V * 731) >> 10);
-            int b = Y + ((U * 1814) >> 10);
-
-
-            // ABGR format for Android Bitmaps (Little Endian)
-            rgbaRow[x] = (0xFF << 24) | (clamp_int(b) << 16) | (clamp_int(g) << 8) | clamp_int(r);
+            outRow[pos] = r;
+            outRow[pos+1] = g;
+            outRow[pos+2] = b;
+            outRow[pos+3] = a;
         }
     }
 
@@ -56,133 +46,24 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNative(
 
 
 extern "C" JNIEXPORT jdouble JNICALL
-Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(
-        JNIEnv* env, jobject, jobject yBuf, jobject uBuf, jobject vBuf,
-        jobject rgbaBuf, jint width, jint height,
-        jint yStride, jint uvRowStride, jint uvPixelStride) {
-
+Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEnv* env, jobject,
+                                    jobject inRgbaBuf, jobject outRgbaBuf,
+                                    jint width, jint height, jint rowStride)
+{
     auto start = std::chrono::high_resolution_clock::now();
 
-    auto* yData = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuf));
-    auto* uData = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuf));
-//    auto* vData = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuf));
-    auto* rgbaData = static_cast<uint32_t*>(env->GetDirectBufferAddress(rgbaBuf));
-
-    const int16x8_t v128 = vdupq_n_s16(128);
+    auto* inData = static_cast<uint8_t*>(env->GetDirectBufferAddress(inRgbaBuf));
+    auto* outData = static_cast<uint8_t*>(env->GetDirectBufferAddress(outRgbaBuf));
 
     for (int y = 0; y < height; y++) {
-        uint32_t* rgbaRow = rgbaData + (y * width);
-        uint8_t* yRow = yData + (y * yStride);
-
-        // Optimization: Pre-calculate the UV row start
-        uint8_t* uRow = uData + (y / 2) * uvRowStride;
-//        uint8_t* vRow = vData + (y / 2) * uvRowStride;  no need because this points to 1 byte ahead to uRow only
-
-        for (int x = 0; x < width; x+=8) { // 8 pixels a time
-                    // 1. Load 8 Y values and convert to 16-bit
-                    uint8x8_t y8 = vld1_u8(yRow + x);
-                    int16x8_t y16 = vreinterpretq_s16_u16(vmovl_u8(y8));
-
-                    // 2. Load and De-interlace U, V
-                    // vld2_u8 handles uvPixelStride = 2 (e.g. U0, V0, U1, V1)
-                    // It puts all U in val[0] and all V in val[1]
-                    uint8x8x2_t uv_interleaved = vld2_u8(uRow + (x / 2) * uvPixelStride);
-
-                    // Duplicate each UV value (U0, U0, U1, U1...) to match 8 Y pixels
-                    uint8x8_t u8 = vzip1_u8(uv_interleaved.val[0], uv_interleaved.val[0]);
-                    uint8x8_t v8 = vzip1_u8(uv_interleaved.val[1], uv_interleaved.val[1]);
-
-                    // 3. Center at 0 (Subtract 128)
-                    int16x8_t u16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8)), v128);
-                    int16x8_t v16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8)), v128);
-
-                    // r
-                    int32x4_t r_low = vmull_n_s16(vget_low_s16(v16), 1436);
-                    int32x4_t r_high = vmull_n_s16(vget_high_s16(v16), 1436);
-                    int16x8_t r_off = vcombine_s16(vshrn_n_s32(r_low, 10), vshrn_n_s32(r_high, 10));
-                    uint8x8_t r8 = vqmovun_s16(vaddq_s16(y16, r_off)); // Auto-clamping to 0-255
-
-                    // b
-                    int32x4_t b_low = vmull_n_s16(vget_low_s16(u16), 1814);
-                    int32x4_t b_high = vmull_n_s16(vget_high_s16(u16), 1814);
-                    int16x8_t b_off = vcombine_s16(vshrn_n_s32(b_low, 10), vshrn_n_s32(b_high, 10));
-                    uint8x8_t b8 = vqmovun_s16(vaddq_s16(y16, b_off));
-
-                    // g
-                    int32x4_t g_sum_low = vmull_n_s16(vget_low_s16(u16), 352);
-                    g_sum_low = vmlal_n_s16(g_sum_low, vget_low_s16(v16), 731);
-
-                    int32x4_t g_sum_high = vmull_n_s16(vget_high_s16(u16), 352);
-                    g_sum_high = vmlal_n_s16(g_sum_high, vget_high_s16(v16), 731);
-
-                    int16x8_t g_off = vcombine_s16(vshrn_n_s32(g_sum_low, 10), vshrn_n_s32(g_sum_high, 10));
-                    uint8x8_t g8 = vqmovun_s16(vsubq_s16(y16, g_off));
-
-                    // Storing as RGBA
-                    uint8x8x4_t rgba;
-                    rgba.val[0] = r8;
-                    rgba.val[1] = g8;
-                    rgba.val[2] = b8;
-                    rgba.val[3] = vdup_n_u8(255); // Alpha
-
-                    vst4_u8(reinterpret_cast<uint8_t*>(rgbaRow + x), rgba);
-
-
-                    // previous version (colour issues)
-//            // Load 8 Y values
-//            uint8x8_t y8 = vld1_u8(x + yRow);
-//            int16x8_t y16 = vreinterpretq_s16_u16(vmovl_u8((y8)));
-//
-//            //Load 4 U values and 4 V values and duplicate them to match 8 pixels
-//            uint8x8_t u4 = vld1_u8(uRow + (x/2)*uvPixelStride), v4 = vld1_u8((vRow + (x/2)*uvPixelStride));
-//
-//            uint8x8_t u8 = vzip1_u8(u4, u4), v8 = vzip1_u8(v4, v4);
-//
-//
-//            int16x8_t v16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8)), v128);
-//            int16x8_t u16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8)), v128);
-//
-//
-//            // 4. Calculate (V * 1436) >> 10
-//            // We must split into two 32-bit halves because 16-bit * 16-bit can exceed 32,767
-//            int32x4_t r_low = vmull_n_s16(vget_low_s16(v16), 1436);
-//            int32x4_t r_high = vmull_n_s16(vget_high_s16(v16), 1436);
-//            // 5. Shift right by 10 and combine back into one 16-bit vector
-//            int16x8_t r_offset = vcombine_s16(vshrn_n_s32(r_low, 10), vshrn_n_s32(r_high, 10));
-//            // 6. Add Y and saturating-narrow back to 8-bit (this handles the "clamping")
-//            uint8x8_t r8 = vqmovun_s16(vreinterpretq_s16_u16(vaddq_s16(vreinterpretq_s16_u16(y16), r_offset)));
-//
-//
-//            r_low = vmull_n_s16(vget_low_s16(u16), 1814);
-//            r_high = vmull_n_s16(vget_high_s16(u16), 1814);
-//            // 5. Shift right by 10 and combine back into one 16-bit vector
-//            r_offset = vcombine_s16(vshrn_n_s32(r_low, 10), vshrn_n_s32(r_high, 10));
-//            // 6. Add Y and saturating-narrow back to 8-bit (this handles the "clamping")
-//            uint8x8_t b8 = vqmovun_s16(vreinterpretq_s16_u16(vaddq_s16(vreinterpretq_s16_u16(y16), r_offset)));
-//
-//
-//            // 2. Calculate the U part: (U * 352)
-//            int32x4_t g_u_low = vmull_n_s16(vget_low_s16(u16), 352);
-//            int32x4_t g_u_high = vmull_n_s16(vget_high_s16(u16), 352);
-//
-//            // 3. Calculate the V part and add it to the U part: (U * 352 + V * 731)
-//            // vmlal (Multiply-Accumulate) performs the multiply and add in one step
-//            int32x4_t g_sum_low = vmlal_n_s16(g_u_low, vget_low_s16(v16), 731);
-//            int32x4_t g_sum_high = vmlal_n_s16(g_u_high, vget_high_s16(v16), 731);
-//
-//            // 4. Shift right by 10 and combine back into a single 16-bit vector
-//            int16x8_t g_offset = vcombine_s16(vshrn_n_s32(g_sum_low, 10), vshrn_n_s32(g_sum_high, 10));
-//
-//            uint8x8_t g8 = vqmovun_s16(vreinterpretq_s16_u16(vsubq_s16(vreinterpretq_s16_u16(y16), g_offset)));
-//
-//            uint8x8x4_t rgba;
-//            rgba.val[0] = r8;
-//            rgba.val[1] = g8;
-//            rgba.val[2] = b8;
-//            rgba.val[3] = vdup_n_u8(255);
-//            vst4_u8(reinterpret_cast<uint8_t*>(rgbaRow + x), rgba);
+        uint8_t* inRow = inData + (y * rowStride);
+        uint8_t* outRow = outData + (y * width * 4);
+        
+        // For SIMD, we can load and store 16 bytes (4 pixels of RGBA) at a time
+        for (int x = 0; x < width * 4; x += 16) {
+            uint8x16_t pixels = vld1q_u8(inRow + x);
+            vst1q_u8(outRow + x, pixels);
         }
-
     }
 
     auto end = std::chrono::high_resolution_clock::now();
