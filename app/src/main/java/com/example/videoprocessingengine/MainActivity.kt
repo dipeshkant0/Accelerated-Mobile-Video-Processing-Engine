@@ -20,6 +20,9 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import android.util.Log
 import android.util.Size
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.core.graphics.createBitmap
 
 
 class MainActivity : AppCompatActivity() {
@@ -39,13 +42,10 @@ class MainActivity : AppCompatActivity() {
     private var targetWidth = 1280
     private var targetHeight = 720
     private lateinit var cameraExecutor: ExecutorService
-
+    
     // frame processing function in c++
-    external fun processFrameNative(
-        y: ByteBuffer, u: ByteBuffer, v: ByteBuffer,
-        rgba: ByteBuffer, width: Int, height: Int,
-        yStride: Int, uvRowStride: Int, uvPixelStride: Int
-    ): Double
+    external fun processFrameNative(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int): Double
+    external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int): Double
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -102,7 +102,18 @@ class MainActivity : AppCompatActivity() {
                 
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setTargetResolution(Size(targetWidth, targetHeight))
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                Size(targetWidth, targetHeight),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                            )
+                        )
+                        .build()
+                )
+
                 .build()
 
             imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
@@ -151,26 +162,59 @@ class MainActivity : AppCompatActivity() {
                 if (rgbaBuffer == null || rgbaBuffer!!.capacity() < width * height * 4) {
                     rgbaBuffer = ByteBuffer.allocateDirect(width * height * 4)
                 }
-                val latency = processFrameNative(
-                    imageProxy.planes[0].buffer,
-                    imageProxy.planes[1].buffer,
-                    imageProxy.planes[2].buffer,
-                    rgbaBuffer!!,
-                    width,
-                    height,
-                    imageProxy.planes[0].rowStride,
-                    imageProxy.planes[1].rowStride,
-                    imageProxy.planes[1].pixelStride
-                )
+
+                val latency = if(currentMode == ProcessingMode.SIMD)
+                {
+                    processFrameNativeSIMD(
+                        imageProxy.planes[0].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride
+                    )
+                }
+                else if (currentMode == ProcessingMode.BASELINE)
+                {
+                    processFrameNative(
+                        imageProxy.planes[0].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride
+                    )
+                }
+                else if(currentMode == ProcessingMode.GPU)
+                {
+                    processFrameNative(
+                        imageProxy.planes[0].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride
+                    )
+                }
+                else{
+                    processFrameNative(
+                        imageProxy.planes[0].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride
+                    )
+                }
+
                 rgbaBuffer!!.rewind()
 
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val bitmap = createBitmap(width, height)
                 bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
+
+                val matrix = Matrix().apply { postRotate(90f) }
+                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, false)
+
 
                 runOnUiThread {
                     // render Frame
-                    binding.processedImageView.rotation = 90f
-                    binding.processedImageView.setImageBitmap(bitmap)
+                    binding.processedImageView.setImageBitmap(rotatedBitmap)
                     frameCount++
                     //update data
                     binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"
