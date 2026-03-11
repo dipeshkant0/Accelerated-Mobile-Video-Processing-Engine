@@ -10,6 +10,7 @@
         android:id="@+id/dashboardCard"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:elevation="16dp"
         android:layout_margin="16dp"
         app:cardBackgroundColor="#CC222222"
         app:cardCornerRadius="12dp"
@@ -90,6 +91,7 @@
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@id/dashboardCard" />
+        app:layout_constraintTop_toTopOf="parent" />
+<!--        app:layout_constraintTop_toBottomOf="@id/dashboardCard" />-->
 
 </androidx.constraintlayout.widget.ConstraintLayout>

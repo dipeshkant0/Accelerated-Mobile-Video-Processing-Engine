@@ -20,6 +20,9 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import android.util.Log
 import android.util.Size
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.core.graphics.createBitmap
 
 
 class MainActivity : AppCompatActivity() {
@@ -36,21 +39,41 @@ class MainActivity : AppCompatActivity() {
 
     enum class ProcessingMode { BASELINE, SIMD, GPU, HYBRID }
     private var currentMode = ProcessingMode.BASELINE
+
+    private var tealOrangeLUT: FloatArray? = null
+    private var blackWhiteLUT: FloatArray? = null
+    private var lutSizeteal: Int = 0
+    private var lutSizebw: Int = 0
+    private var currentLUT: FloatArray? = null
+    private var lutSize: Int = 0
     private var targetWidth = 1280
     private var targetHeight = 720
     private lateinit var cameraExecutor: ExecutorService
-
+    
     // frame processing function in c++
-    external fun processFrameNative(
-        y: ByteBuffer, u: ByteBuffer, v: ByteBuffer,
-        rgba: ByteBuffer, width: Int, height: Int,
-        yStride: Int, uvRowStride: Int, uvPixelStride: Int
-    ): Double
+    external fun processFrameNative(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
+    external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int): Double
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // Preload all available LUTs exactly once when the app opens
+        val bwLutData = LutParser.parseCubeFile(this, "LUTs/BlackAndWhiteLUT.cube")
+        if (bwLutData != null) {
+            blackWhiteLUT = bwLutData.data
+            lutSizebw = bwLutData.size
+        }
+
+        val tealOrangeLutData = LutParser.parseCubeFile(this, "LUTs/TealOrangeLUT.cube")
+        if (tealOrangeLutData != null) {
+            tealOrangeLUT = tealOrangeLutData.data
+            lutSizeteal = tealOrangeLutData.size
+        }
+
+        // Set the default LUT
+        currentLUT = tealOrangeLUT
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
@@ -86,6 +109,18 @@ class MainActivity : AppCompatActivity() {
                 targetHeight = 1080
                 restartCamera()
             }
+            R.id.teal_orange -> {
+                currentLUT = tealOrangeLUT
+                lutSize = lutSizeteal
+            }
+            R.id.black_white -> {
+                currentLUT = blackWhiteLUT
+                lutSize = lutSizebw
+            }
+            R.id.no_lut -> {
+                currentLUT = null
+                lutSize = 0
+            }
         }
         return true
     }
@@ -102,14 +137,25 @@ class MainActivity : AppCompatActivity() {
                 
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setTargetResolution(Size(targetWidth, targetHeight))
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                Size(targetWidth, targetHeight),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                            )
+                        )
+                        .build()
+                )
+
                 .build()
 
             imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
                 val width = imageProxy.width
                 val height = imageProxy.height
 
-                //Fetch Temperature
+                // 1. Fetch live Battery Temperature
                 val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
                 val batteryStatus = registerReceiver(null, intentFilter)
                 val temp = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
@@ -148,29 +194,45 @@ class MainActivity : AppCompatActivity() {
                 }
 
 
+                // 2. Initialize memory for the frame if it doesn't exist yet
                 if (rgbaBuffer == null || rgbaBuffer!!.capacity() < width * height * 4) {
                     rgbaBuffer = ByteBuffer.allocateDirect(width * height * 4)
                 }
-                val latency = processFrameNative(
-                    imageProxy.planes[0].buffer,
-                    imageProxy.planes[1].buffer,
-                    imageProxy.planes[2].buffer,
-                    rgbaBuffer!!,
-                    width,
-                    height,
-                    imageProxy.planes[0].rowStride,
-                    imageProxy.planes[1].rowStride,
-                    imageProxy.planes[1].pixelStride
-                )
+
+                // 3. Send the frame to C++ based on the selected mode
+                val latency = if (currentMode == ProcessingMode.SIMD) {
+                    processFrameNativeSIMD(
+                        imageProxy.planes[0].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride
+                    )
+                } else {
+                    processFrameNative(
+                        imageProxy.planes[0].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride,
+                        currentLUT,
+                        lutSize
+                    )
+                }
+
                 rgbaBuffer!!.rewind()
 
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                // 4. Convert the raw returned buffer into a Bitmap so the screen can show it
+                val bitmap = createBitmap(width, height)
                 bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
+
+                val matrix = Matrix().apply { postRotate(90f) }
+                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, false)
+
 
                 runOnUiThread {
                     // render Frame
-                    binding.processedImageView.rotation = 90f
-                    binding.processedImageView.setImageBitmap(bitmap)
+                    binding.processedImageView.setImageBitmap(rotatedBitmap)
                     frameCount++
                     //update data
                     binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"
