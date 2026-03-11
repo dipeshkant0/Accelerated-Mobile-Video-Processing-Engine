@@ -39,18 +39,41 @@ class MainActivity : AppCompatActivity() {
 
     enum class ProcessingMode { BASELINE, SIMD, GPU, HYBRID }
     private var currentMode = ProcessingMode.BASELINE
+
+    private var tealOrangeLUT: FloatArray? = null
+    private var blackWhiteLUT: FloatArray? = null
+    private var lutSizeteal: Int = 0
+    private var lutSizebw: Int = 0
+    private var currentLUT: FloatArray? = null
+    private var lutSize: Int = 0
     private var targetWidth = 1280
     private var targetHeight = 720
     private lateinit var cameraExecutor: ExecutorService
     
     // frame processing function in c++
-    external fun processFrameNative(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int): Double
+    external fun processFrameNative(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
     external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int): Double
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // Preload all available LUTs exactly once when the app opens
+        val bwLutData = LutParser.parseCubeFile(this, "LUTs/BlackAndWhiteLUT.cube")
+        if (bwLutData != null) {
+            blackWhiteLUT = bwLutData.data
+            lutSizebw = bwLutData.size
+        }
+
+        val tealOrangeLutData = LutParser.parseCubeFile(this, "LUTs/TealOrangeLUT.cube")
+        if (tealOrangeLutData != null) {
+            tealOrangeLUT = tealOrangeLutData.data
+            lutSizeteal = tealOrangeLutData.size
+        }
+
+        // Set the default LUT
+        currentLUT = tealOrangeLUT
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
@@ -86,6 +109,18 @@ class MainActivity : AppCompatActivity() {
                 targetHeight = 1080
                 restartCamera()
             }
+            R.id.teal_orange -> {
+                currentLUT = tealOrangeLUT
+                lutSize = lutSizeteal
+            }
+            R.id.black_white -> {
+                currentLUT = blackWhiteLUT
+                lutSize = lutSizebw
+            }
+            R.id.no_lut -> {
+                currentLUT = null
+                lutSize = 0
+            }
         }
         return true
     }
@@ -120,7 +155,7 @@ class MainActivity : AppCompatActivity() {
                 val width = imageProxy.width
                 val height = imageProxy.height
 
-                //Fetch Temperature
+                // 1. Fetch live Battery Temperature
                 val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
                 val batteryStatus = registerReceiver(null, intentFilter)
                 val temp = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
@@ -159,12 +194,13 @@ class MainActivity : AppCompatActivity() {
                 }
 
 
+                // 2. Initialize memory for the frame if it doesn't exist yet
                 if (rgbaBuffer == null || rgbaBuffer!!.capacity() < width * height * 4) {
                     rgbaBuffer = ByteBuffer.allocateDirect(width * height * 4)
                 }
 
-                val latency = if(currentMode == ProcessingMode.SIMD)
-                {
+                // 3. Send the frame to C++ based on the selected mode
+                val latency = if (currentMode == ProcessingMode.SIMD) {
                     processFrameNativeSIMD(
                         imageProxy.planes[0].buffer,
                         rgbaBuffer!!,
@@ -172,39 +208,21 @@ class MainActivity : AppCompatActivity() {
                         height,
                         imageProxy.planes[0].rowStride
                     )
-                }
-                else if (currentMode == ProcessingMode.BASELINE)
-                {
+                } else {
                     processFrameNative(
                         imageProxy.planes[0].buffer,
                         rgbaBuffer!!,
                         width,
                         height,
-                        imageProxy.planes[0].rowStride
-                    )
-                }
-                else if(currentMode == ProcessingMode.GPU)
-                {
-                    processFrameNative(
-                        imageProxy.planes[0].buffer,
-                        rgbaBuffer!!,
-                        width,
-                        height,
-                        imageProxy.planes[0].rowStride
-                    )
-                }
-                else{
-                    processFrameNative(
-                        imageProxy.planes[0].buffer,
-                        rgbaBuffer!!,
-                        width,
-                        height,
-                        imageProxy.planes[0].rowStride
+                        imageProxy.planes[0].rowStride,
+                        currentLUT,
+                        lutSize
                     )
                 }
 
                 rgbaBuffer!!.rewind()
 
+                // 4. Convert the raw returned buffer into a Bitmap so the screen can show it
                 val bitmap = createBitmap(width, height)
                 bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
 
