@@ -29,4 +29,22 @@
         </group>
     </menu>
 </item>
+
+<item android:title="Select LUT">
+    <menu>
+        <group android:id="@+id/lut_group" android:checkableBehavior="single">
+            <item
+                android:id="@+id/no_lut"
+                android:title="None" />
+            <item
+                android:id="@+id/teal_orange"
+                android:title="Teal Orange"
+                android:checked="true" />
+            <item
+            android:id="@+id/black_white"
+            android:title="Black and White" />
+        </group>
+    </menu>
+</item>
+
 </menu>
