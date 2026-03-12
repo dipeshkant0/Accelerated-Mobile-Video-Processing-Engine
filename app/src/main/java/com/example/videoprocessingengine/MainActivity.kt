@@ -28,6 +28,8 @@ import androidx.core.graphics.createBitmap
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var rgbaBuffer: ByteBuffer? = null
+
+    private var reusableBitmap: Bitmap? = null
     private var lastFrameTimestamp = 0L
     private var frameCount = 0
     private var fps = 0.0
@@ -147,7 +149,7 @@ class MainActivity : AppCompatActivity() {
                             )
                         ).build()
                 ).build()
-
+            binding.processedImageView.rotation = 90f
             imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
                 val width = imageProxy.width
                 val height = imageProxy.height
@@ -222,8 +224,11 @@ class MainActivity : AppCompatActivity() {
                 rgbaBuffer!!.rewind()
 
                 // Convert the raw returned buffer into a Bitmap so the screen can show it
-                val bitmap = createBitmap(width, height)
-                bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
+                if (reusableBitmap == null || reusableBitmap!!.width != width || reusableBitmap!!.height != height) {
+                    reusableBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                }
+
+                reusableBitmap!!.copyPixelsFromBuffer(rgbaBuffer!!)
 
 //                val matrix = Matrix().apply { postRotate(90f) }
 //                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, false)
@@ -231,7 +236,7 @@ class MainActivity : AppCompatActivity() {
 
                 runOnUiThread {
                     // render Frame
-                    binding.processedImageView.setImageBitmap(bitmap)
+                    binding.processedImageView.setImageBitmap(reusableBitmap)
                     frameCount++
                     //update data
                     binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"
