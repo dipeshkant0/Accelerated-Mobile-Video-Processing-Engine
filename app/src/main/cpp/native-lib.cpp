@@ -30,7 +30,7 @@ public:
 private:
     ThreadPool() : stop(false), pending(0) {
         // Determine number of cores
-        int cores = std::max(1u, std::thread::hardware_concurrency() - 1);
+        int cores = std::max(1u, std::thread::hardware_concurrency()/2);
         // Create all threads
         for (int i = 0; i < cores; ++i) {
             workers.emplace_back([this] {
