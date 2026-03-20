@@ -28,6 +28,8 @@ import androidx.core.graphics.createBitmap
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var rgbaBuffer: ByteBuffer? = null
+
+    private var reusableBitmap: Bitmap? = null
     private var lastFrameTimestamp = 0L
     private var frameCount = 0
     private var fps = 0.0
@@ -52,7 +54,7 @@ class MainActivity : AppCompatActivity() {
     
     // frame processing function in c++
     external fun processFrameNative(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
-    external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int): Double
+    external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -145,12 +147,9 @@ class MainActivity : AppCompatActivity() {
                                 Size(targetWidth, targetHeight),
                                 ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                             )
-                        )
-                        .build()
-                )
-
-                .build()
-
+                        ).build()
+                ).build()
+            binding.processedImageView.rotation = 90f
             imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
                 val width = imageProxy.width
                 val height = imageProxy.height
@@ -194,19 +193,21 @@ class MainActivity : AppCompatActivity() {
                 }
 
 
-                // 2. Initialize memory for the frame if it doesn't exist yet
+                // Initialize memory for the frame if it doesn't exist yet
                 if (rgbaBuffer == null || rgbaBuffer!!.capacity() < width * height * 4) {
                     rgbaBuffer = ByteBuffer.allocateDirect(width * height * 4)
                 }
 
-                // 3. Send the frame to C++ based on the selected mode
+                // Send the frame to C++ based on the selected mode
                 val latency = if (currentMode == ProcessingMode.SIMD) {
                     processFrameNativeSIMD(
                         imageProxy.planes[0].buffer,
                         rgbaBuffer!!,
                         width,
                         height,
-                        imageProxy.planes[0].rowStride
+                        imageProxy.planes[0].rowStride,
+                        currentLUT,
+                        lutSize
                     )
                 } else {
                     processFrameNative(
@@ -222,17 +223,20 @@ class MainActivity : AppCompatActivity() {
 
                 rgbaBuffer!!.rewind()
 
-                // 4. Convert the raw returned buffer into a Bitmap so the screen can show it
-                val bitmap = createBitmap(width, height)
-                bitmap.copyPixelsFromBuffer(rgbaBuffer!!)
+                // Convert the raw returned buffer into a Bitmap so the screen can show it
+                if (reusableBitmap == null || reusableBitmap!!.width != width || reusableBitmap!!.height != height) {
+                    reusableBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                }
 
-                val matrix = Matrix().apply { postRotate(90f) }
-                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, false)
+                reusableBitmap!!.copyPixelsFromBuffer(rgbaBuffer!!)
+
+//                val matrix = Matrix().apply { postRotate(90f) }
+//                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, false)
 
 
                 runOnUiThread {
                     // render Frame
-                    binding.processedImageView.setImageBitmap(rotatedBitmap)
+                    binding.processedImageView.setImageBitmap(reusableBitmap)
                     frameCount++
                     //update data
                     binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"
@@ -258,6 +262,8 @@ class MainActivity : AppCompatActivity() {
     private fun allPermissionsGranted() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
     companion object {
-        init { System.loadLibrary("videoprocessingengine") }
+        init {
+            System.loadLibrary("videoprocessingengine")
+        }
     }
 }
