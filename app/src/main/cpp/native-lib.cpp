@@ -1,11 +1,80 @@
-
 #include <jni.h>
 #include <chrono>
 #include <algorithm>
 #include <arm_neon.h>
 #include <thread>
 #include <vector>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
 
+
+// Sigleton design pattern for Thread Pool
+class ThreadPool {
+public:
+    static ThreadPool& getInstance() {
+        static ThreadPool instance;
+        return instance;
+    }
+    void executeAndWait(const std::vector<std::function<void()>>& tasks) {
+
+        std::unique_lock<std::mutex> lock(mtx);
+        pending = tasks.size();
+        for (auto& t : tasks) queue.push(t);
+        // Wake up all threads
+        cv_workers.notify_all();
+        // Wait for all threads to finish
+        cv_main.wait(lock, [this] { return pending == 0; });
+    }
+private:
+    ThreadPool() : stop(false), pending(0) {
+        // Determine number of cores
+        int cores = std::max(1u, std::thread::hardware_concurrency() - 1);
+        // Create all threads
+        for (int i = 0; i < cores; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        cv_workers.wait(lock, [this] { return stop || !queue.empty(); });
+                        if (stop && queue.empty()) return;
+                        task = std::move(queue.front()); queue.pop();
+                    }
+
+                    task(); // Do the math
+
+                    {
+                        std::lock_guard<std::mutex> lock(mtx);
+                        if (--pending == 0) cv_main.notify_one();
+                    }
+                }
+            });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv_workers.notify_all();
+        // Wait for all threads to finish
+        for (auto& w : workers) w.join();
+    }
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> queue;
+    std::mutex mtx;
+    std::condition_variable cv_workers, cv_main;
+    int pending;
+    bool stop;
+};
+
+JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+    ThreadPool::getInstance();
+    return JNI_VERSION_1_6;
+}
 
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_example_videoprocessingengine_MainActivity_processFrameNative(JNIEnv* env, jobject,jobject inRgbaBuf, jobject outRgbaBuf,jint width, jint height, jint rowStride, jfloatArray lutArray, jint lutSize)
@@ -107,14 +176,8 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNative(JNIEnv* e
 }
 
 
-
-
-
 extern "C" JNIEXPORT jdouble JNICALL
-Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEnv* env, jobject,
-                                    jobject inRgbaBuf, jobject outRgbaBuf,
-                                    jint width, jint height, jint rowStride, jfloatArray lutArray, jint lutSize)
-{
+Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEnv* env, jobject, jobject inRgbaBuf, jobject outRgbaBuf,jint width, jint height, jint rowStride, jfloatArray lutArray, jint lutSize){
     auto start = std::chrono::high_resolution_clock::now();
 
     auto* inData = static_cast<uint8_t*>(env->GetDirectBufferAddress(inRgbaBuf));
@@ -125,15 +188,28 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEn
         lut = env->GetFloatArrayElements(lutArray, nullptr);
     }
 
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    int chunk_size = height / num_threads;
+    std::vector<std::function<void()>> tasks;
+
+
     // If no LUT is selected, fallback to the super-fast SIMD memory copy
     if (lut == nullptr) {
-        for (int y = 0; y < height; y++) {
-            uint8_t* inRow = inData + (y * rowStride);
-            uint8_t* outRow = outData + (y * width * 4);
-            for (int x = 0; x < width * 4; x += 16) {
-                vst1q_u8(outRow + x, vld1q_u8(inRow + x));
-            }
+        for (int t = 0; t < num_threads; t++) {
+            tasks.emplace_back([=]() {
+                int start_y = t * chunk_size;
+                int end_y = (t == num_threads - 1) ? height : start_y + chunk_size;
+                for (int y = start_y; y < end_y; y++) {
+                    uint8_t* inRow = inData + (y * rowStride);
+                    uint8_t* outRow = outData + (y * width * 4);
+                    for (int x = 0; x < width * 4; x += 16) {
+                        vst1q_u8(outRow + x, vld1q_u8(inRow + x));
+                    }
+                }
+            });
         }
+        ThreadPool::getInstance().executeAndWait(tasks);
         auto end = std::chrono::high_resolution_clock::now();
         return static_cast<jdouble>(std::chrono::duration<double, std::milli>(end - start).count());
     }
@@ -152,17 +228,11 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEn
         return vmlaq_f32(vmulq_f32(inv_d, c0), d, c1);
     };
 
-    int num_threads = std::thread::hardware_concurrency()-1;
-    //default case
-    if (num_threads == 0) num_threads = 4;
-
-    std::vector<std::thread> threads;
-    int chunk_size = height / num_threads;
 
     // Spawn the threads
     for (int t = 0; t < num_threads; t++) {
         // We use [=] to pass all our SIMD constants and pointers into the thread safely
-        threads.emplace_back([=]() {
+        tasks.emplace_back([=]() {
 
             // Calculate which rows this specific core will process
             int start_y = t * chunk_size;
@@ -292,9 +362,7 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEn
     }
 
     // Wait for all CPU cores to finish their chunk of the image
-    for (auto& thread : threads) {
-        thread.join();
-    }
+    ThreadPool::getInstance().executeAndWait(tasks);
 
     if (lut != nullptr) { env->ReleaseFloatArrayElements(lutArray, lut, JNI_ABORT); }
 
