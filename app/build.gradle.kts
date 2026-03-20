@@ -19,7 +19,7 @@ android {
             cmake {
                 // -O3 enables high-level optimization for your SIMD code
                 cppFlags("-std=c++17 -O3")
-                // Enables NEON support for the compiler
+                // Enables NEON and STL support for the compiler
                 arguments("-DANDROID_ARM_NEON=ON")
                 // Target specifically the 64-bit architecture of your phone
                 abiFilters("arm64-v8a")

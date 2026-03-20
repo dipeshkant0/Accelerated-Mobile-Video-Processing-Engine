@@ -262,6 +262,8 @@ class MainActivity : AppCompatActivity() {
     private fun allPermissionsGranted() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
     companion object {
-        init { System.loadLibrary("videoprocessingengine") }
+        init {
+            System.loadLibrary("videoprocessingengine")
+        }
     }
 }
