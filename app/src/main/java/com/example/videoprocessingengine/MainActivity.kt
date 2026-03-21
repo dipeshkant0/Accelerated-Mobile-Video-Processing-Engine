@@ -75,7 +75,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Set the default LUT
-        currentLUT = tealOrangeLUT
+        currentLUT = null
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
