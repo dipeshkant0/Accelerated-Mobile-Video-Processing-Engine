@@ -38,6 +38,9 @@ class MainActivity : AppCompatActivity() {
     private var lastCpuTime = 0L
     private var lastRealTime = 0L
     private var tempInCelsius = 0.0
+    private var totalLatencyOverInterval = 0.0
+    private var latencyFrameCount = 0
+    private var displayLatency = 0.0
 
     enum class ProcessingMode { BASELINE, SIMD, GPU, HYBRID }
     private var currentMode = ProcessingMode.BASELINE
@@ -53,8 +56,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     
     // frame processing function in c++
-    external fun processFrameNative(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
-    external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgba: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
+    external fun processFrameNative(inRgba: ByteBuffer, outRgbaBuf: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
+    external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgbaBuf: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
+    external fun processFrameNativeGPU(inRgba: ByteBuffer, outRgbaBuf: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -100,6 +104,9 @@ class MainActivity : AppCompatActivity() {
             }
             R.id.mode_simd -> {
                 currentMode = ProcessingMode.SIMD
+            }
+            R.id.mode_gpu -> {
+                currentMode = ProcessingMode.GPU
             }
             R.id.res_720p -> {
                 targetWidth = 1280
@@ -174,6 +181,13 @@ class MainActivity : AppCompatActivity() {
 
                     fps = (frameCount * 1000.0) / timeInterval
 
+                    // Average the latency over the frames processed in the last second
+                    if (latencyFrameCount > 0) {
+                        displayLatency = totalLatencyOverInterval / latencyFrameCount
+                    }
+                    totalLatencyOverInterval = 0.0
+                    latencyFrameCount = 0
+
                     val cpuDiff = currentCpuTime - lastCpuTime
                     val realDiff = timeInterval * 1_000_000L
                     cpuUsage = (cpuDiff.toDouble() / realDiff.toDouble()) * 100.0
@@ -209,6 +223,16 @@ class MainActivity : AppCompatActivity() {
                         currentLUT,
                         lutSize
                     )
+                } else if (currentMode == ProcessingMode.GPU) {
+                    processFrameNativeGPU(
+                        imageProxy.planes[0].buffer,
+                        rgbaBuffer!!,
+                        width,
+                        height,
+                        imageProxy.planes[0].rowStride,
+                        currentLUT,
+                        lutSize
+                    )
                 } else {
                     processFrameNative(
                         imageProxy.planes[0].buffer,
@@ -220,6 +244,10 @@ class MainActivity : AppCompatActivity() {
                         lutSize
                     )
                 }
+
+                // Accumulate latency over the interval
+                totalLatencyOverInterval += latency
+                latencyFrameCount++
 
                 rgbaBuffer!!.rewind()
 
@@ -240,7 +268,7 @@ class MainActivity : AppCompatActivity() {
                     frameCount++
                     //update data
                     binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"
-                    binding.latencyVal.text = String.format("LAT: %.1f ms", latency)
+                    binding.latencyVal.text = String.format("LAT: %.1f ms", displayLatency)
                     binding.fpsVal.text = String.format("FPS: %.1f", fps)
                     binding.cpuVal.text = String.format("CPU: %.0f%%", cpuUsage)
                     binding.memVal.text = "MEM: ${memoryUsage}MB"

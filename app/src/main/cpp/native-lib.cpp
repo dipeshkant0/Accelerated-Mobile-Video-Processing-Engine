@@ -1,13 +1,19 @@
 #include <jni.h>
+#include <EGL/egl.h>
+#include <GLES3/gl31.h>
 #include <chrono>
 #include <algorithm>
 #include <arm_neon.h>
+#include <android/log.h>
 #include <thread>
 #include <vector>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+
+#define LOG_TAG "NativeGPU"
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 
 // Sigleton design pattern for Thread Pool
@@ -368,4 +374,270 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEn
 
     auto end = std::chrono::high_resolution_clock::now();
     return static_cast<jdouble>(std::chrono::duration<double, std::milli>(end - start).count());
+}
+
+class GPUProcessor {
+public:
+  static GPUProcessor &getInstance() {
+    static GPUProcessor instance;
+    return instance;
+  }
+
+  void process(uint8_t *inData, uint8_t *outData, int width, int height,
+               int rowStride, float *lut, int lutSize, bool lutChanged) {
+    initEGL();
+    if (eglContext != EGL_NO_CONTEXT && eglGetCurrentContext() != eglContext) {
+      eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+    }
+    initGL(width, height);
+
+    glBindTexture(GL_TEXTURE_2D, frameTex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowStride / 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA,
+                    GL_UNSIGNED_BYTE, inData);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+    if (lut != nullptr && lutSize > 0) {
+      if (lutChanged) {
+        glBindTexture(GL_TEXTURE_3D, lutTex);
+        // Phones don't guarantee linear filtering for GL_RGB32F.
+        // We convert the float LUT to an 8-bit unsigned byte array to guarantee
+        // compatibility & free hardware trilinear filtering.
+        std::vector<uint8_t> lut8(lutSize * lutSize * lutSize * 3);
+        int totalElements = lutSize * lutSize * lutSize * 3;
+        for (int i = 0; i < totalElements; i++) {
+          lut8[i] = static_cast<uint8_t>(
+              std::max(0.0f, std::min(255.0f, lut[i] * 255.0f)));
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT,
+                      1); // VERY CRITICAL for RGB8 textures that may have odd
+                          // dimensions like 33.
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB8, lutSize, lutSize, lutSize, 0,
+                     GL_RGB, GL_UNSIGNED_BYTE, lut8.data());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4); // Reset to default
+        hasLut = true;
+      }
+    } else {
+      hasLut = false;
+    }
+
+    glUseProgram(computeProgram);
+    glUniform1i(glGetUniformLocation(computeProgram, "hasLut"), hasLut ? 1 : 0);
+
+    glBindImageTexture(0, frameTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+    glBindImageTexture(1, outTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_3D, lutTex);
+    glUniform1i(glGetUniformLocation(computeProgram, "lutSampler"), 2);
+
+    GLuint groupX = (width + 15) / 16;
+    GLuint groupY = (height + 15) / 16;
+    glDispatchCompute(groupX, groupY, 1);
+
+    // Wait for the compute shader to finish storing to outTex
+    glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           outTex, 0);
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, width);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, outData);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  }
+
+private:
+  EGLDisplay eglDisplay = EGL_NO_DISPLAY;
+  EGLContext eglContext = EGL_NO_CONTEXT;
+  EGLSurface eglSurface = EGL_NO_SURFACE;
+  bool initialized = false;
+
+  GLuint computeProgram = 0;
+  GLuint frameTex = 0;
+  GLuint outTex = 0;
+  GLuint lutTex = 0;
+  GLuint fbo = 0;
+  int texWidth = 0;
+  int texHeight = 0;
+  bool hasLut = false;
+
+  GPUProcessor() {}
+
+  void initEGL() {
+    if (initialized)
+      return;
+
+    eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(eglDisplay, nullptr, nullptr);
+
+    const EGLint configAttribs[] = {EGL_SURFACE_TYPE,
+                                    EGL_PBUFFER_BIT,
+                                    EGL_RENDERABLE_TYPE,
+                                    EGL_OPENGL_ES2_BIT,
+                                    EGL_RED_SIZE,
+                                    8,
+                                    EGL_GREEN_SIZE,
+                                    8,
+                                    EGL_BLUE_SIZE,
+                                    8,
+                                    EGL_ALPHA_SIZE,
+                                    8,
+                                    EGL_NONE};
+
+    EGLConfig config;
+    EGLint numConfigs;
+    eglChooseConfig(eglDisplay, configAttribs, &config, 1, &numConfigs);
+    if (numConfigs == 0) {
+      const EGLint fallbackAttribs[] = {EGL_NONE};
+      eglChooseConfig(eglDisplay, fallbackAttribs, &config, 1, &numConfigs);
+    }
+
+    const EGLint pbufferAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+    eglSurface = eglCreatePbufferSurface(eglDisplay, config, pbufferAttribs);
+
+    const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    eglContext =
+        eglCreateContext(eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
+
+    eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+
+    initialized = true;
+  }
+
+  void initGL(int w, int h) {
+    if (computeProgram == 0) {
+      const char *shaderSrc = R"(#version 310 es
+                precision mediump float;
+                precision mediump image2D;
+                precision mediump sampler3D;
+
+                layout(local_size_x = 16, local_size_y = 16) in;
+                layout(binding = 0, rgba8) uniform readonly image2D inTexture;
+                layout(binding = 1, rgba8) uniform writeonly image2D outTexture;
+
+                uniform sampler3D lutSampler;
+                uniform int hasLut;
+
+                void main() {
+                    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+                    ivec2 size = imageSize(inTexture);
+                    if (pos.x >= size.x || pos.y >= size.y) return;
+
+                    vec4 color = imageLoad(inTexture, pos);
+                    
+                    if (hasLut == 1) {
+                        vec3 lutColor = texture(lutSampler, color.rgb).rgb;
+                        imageStore(outTexture, pos, vec4(lutColor, color.a));
+                    } else {
+                        imageStore(outTexture, pos, color);
+                    }
+                }
+            )";
+
+      GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+      glShaderSource(shader, 1, &shaderSrc, nullptr);
+      glCompileShader(shader);
+
+      GLint success;
+      glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+      if (!success) {
+        char infoLog[512];
+        glGetShaderInfoLog(shader, 512, nullptr, infoLog);
+        LOGE("Compute Shader Error: %s", infoLog);
+      }
+
+      computeProgram = glCreateProgram();
+      glAttachShader(computeProgram, shader);
+      glLinkProgram(computeProgram);
+      glDeleteShader(shader);
+    }
+
+    if (texWidth != w || texHeight != h) {
+      if (frameTex)
+        glDeleteTextures(1, &frameTex);
+      if (outTex)
+        glDeleteTextures(1, &outTex);
+      if (fbo)
+        glDeleteFramebuffers(1, &fbo);
+
+      glGenTextures(1, &frameTex);
+      glBindTexture(GL_TEXTURE_2D, frameTex);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+      glGenTextures(1, &outTex);
+      glBindTexture(GL_TEXTURE_2D, outTex);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+      glGenFramebuffers(1, &fbo);
+
+      texWidth = w;
+      texHeight = h;
+    }
+
+    if (lutTex == 0) {
+      glGenTextures(1, &lutTex);
+      glBindTexture(GL_TEXTURE_3D, lutTex);
+      // Linear filtering is required for hardware trilinear interpolation
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    }
+  }
+};
+
+static jobject globalLastLutArray = nullptr;
+
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_videoprocessingengine_MainActivity_processFrameNativeGPU(
+    JNIEnv *env, jobject, jobject inRgbaBuf, jobject outRgbaBuf, jint width,
+    jint height, jint rowStride, jfloatArray lutArray, jint lutSize) {
+  auto start = std::chrono::high_resolution_clock::now();
+
+  auto *inData = static_cast<uint8_t *>(env->GetDirectBufferAddress(inRgbaBuf));
+  auto *outData =
+      static_cast<uint8_t *>(env->GetDirectBufferAddress(outRgbaBuf));
+
+  bool lutChanged = false;
+  if (lutArray == nullptr) {
+      if (globalLastLutArray != nullptr) {
+          env->DeleteGlobalRef(globalLastLutArray);
+          globalLastLutArray = nullptr;
+          lutChanged = true;
+      }
+  } else {
+      if (globalLastLutArray == nullptr || !env->IsSameObject(lutArray, globalLastLutArray)) {
+          if (globalLastLutArray != nullptr) {
+              env->DeleteGlobalRef(globalLastLutArray);
+          }
+          globalLastLutArray = env->NewGlobalRef(lutArray);
+          lutChanged = true;
+      }
+  }
+
+  jfloat *lut = nullptr;
+  if (lutArray != nullptr && lutSize > 0) {
+    lut = env->GetFloatArrayElements(lutArray, nullptr);
+  }
+
+  GPUProcessor::getInstance().process(inData, outData, width, height, rowStride,
+                                      lut, lutSize, lutChanged);
+
+  if (lut != nullptr) {
+    env->ReleaseFloatArrayElements(lutArray, lut, JNI_ABORT);
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  return static_cast<jdouble>(
+      std::chrono::duration<double, std::milli>(end - start).count());
 }
