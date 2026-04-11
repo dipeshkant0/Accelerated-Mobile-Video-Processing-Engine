@@ -1,4 +1,6 @@
 #include <jni.h>
+#include <EGL/egl.h>
+#include <GLES3/gl31.h>
 #include <chrono>
 #include <algorithm>
 #include <arm_neon.h>
@@ -164,6 +166,156 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNative(JNIEnv* e
                 outRow[pos+3] = a;
             }
         }
+        ThreadPool::getInstance().executeAndWait(tasks);
+        auto end = std::chrono::high_resolution_clock::now();
+        return static_cast<jdouble>(std::chrono::duration<double, std::milli>(end - start).count());
+    }
+
+    float max_index = static_cast<float>(std::max(lutSize - 1, 1));
+    int size2 = lutSize * lutSize;
+
+    float32x4_t v_max_index = vdupq_n_f32(max_index);
+    float32x4_t v_255_inv   = vdupq_n_f32(1.0f / 255.0f);
+    float32x4_t v_255       = vdupq_n_f32(255.0f);
+    float32x4_t v_one       = vdupq_n_f32(1.0f);
+    float32x4_t v_zero      = vdupq_n_f32(0.0f);
+
+    // SIMD Helper function for Fused-Multiply-Add (FMA) Interpolation
+    auto mix_colors = [](float32x4_t c0, float32x4_t c1, float32x4_t d, float32x4_t inv_d) {
+        return vmlaq_f32(vmulq_f32(inv_d, c0), d, c1);
+    };
+
+
+    // Spawn the threads
+    for (int t = 0; t < num_threads; t++) {
+        // We use [=] to pass all our SIMD constants and pointers into the thread safely
+        tasks.emplace_back([=]() {
+
+            // Calculate which rows this specific core will process
+            int start_y = t * chunk_size;
+            int end_y = (t == num_threads - 1) ? height : start_y + chunk_size;
+
+            for (int y = start_y; y < end_y; y++) {
+                uint8_t* inRow = inData + (y * rowStride);
+                uint8_t* outRow = outData + (y * width * 4);
+
+                int x = 0;
+                // Process 4 pixels (16 bytes) at a time
+                for (; x <= (width - 4) * 4; x += 16) {
+                    uint8_t *p = inRow + x;
+
+                    //Extract R, G, B, A for 4 pixels
+                    uint32_t r_arr[4] = {p[0], p[4], p[8], p[12]};
+                    uint32_t g_arr[4] = {p[1], p[5], p[9], p[13]};
+                    uint32_t b_arr[4] = {p[2], p[6], p[10], p[14]};
+                    uint32_t a_arr[4] = {p[3], p[7], p[11], p[15]};
+
+                    // Load into SIMD Float Vectors
+                    float32x4_t r_f = vcvtq_f32_u32(vld1q_u32(r_arr));
+                    float32x4_t g_f = vcvtq_f32_u32(vld1q_u32(g_arr));
+                    float32x4_t b_f = vcvtq_f32_u32(vld1q_u32(b_arr));
+
+                    // Normalize (0.0 - 1.0) and multiply by max_index
+                    float32x4_t lutX = vmulq_f32(vmulq_f32(r_f, v_255_inv), v_max_index);
+                    float32x4_t lutY = vmulq_f32(vmulq_f32(g_f, v_255_inv), v_max_index);
+                    float32x4_t lutZ = vmulq_f32(vmulq_f32(b_f, v_255_inv), v_max_index);
+
+                    //Get Base Grid Coordinates (x0, y0, z0)
+                    uint32x4_t x0_u = vcvtq_u32_f32(lutX);
+                    uint32x4_t y0_u = vcvtq_u32_f32(lutY);
+                    uint32x4_t z0_u = vcvtq_u32_f32(lutZ);
+
+                    //Get Distances (dx, dy, dz) & Inverted Distances
+                    float32x4_t dx = vsubq_f32(lutX, vcvtq_f32_u32(x0_u));
+                    float32x4_t dy = vsubq_f32(lutY, vcvtq_f32_u32(y0_u));
+                    float32x4_t dz = vsubq_f32(lutZ, vcvtq_f32_u32(z0_u));
+
+                    float32x4_t inv_dx = vsubq_f32(v_one, dx);
+                    float32x4_t inv_dy = vsubq_f32(v_one, dy);
+                    float32x4_t inv_dz = vsubq_f32(v_one, dz);
+
+                    //Calculate memory indices and gather LUT floats
+                    uint32_t x0_arr[4], y0_arr[4], z0_arr[4];
+                    vst1q_u32(x0_arr, x0_u);
+                    vst1q_u32(y0_arr, y0_u);
+                    vst1q_u32(z0_arr, z0_u);
+
+                    float c000_R[4], c100_R[4], c010_R[4], c110_R[4], c001_R[4], c101_R[4], c011_R[4], c111_R[4];
+                    float c000_G[4], c100_G[4], c010_G[4], c110_G[4], c001_G[4], c101_G[4], c011_G[4], c111_G[4];
+                    float c000_B[4], c100_B[4], c010_B[4], c110_B[4], c001_B[4], c101_B[4], c011_B[4], c111_B[4];
+
+                    for (int i = 0; i < 4; i++) {
+                        int x0 = x0_arr[i]; int y0 = y0_arr[i]; int z0 = z0_arr[i];
+                        int x1 = std::min(x0 + 1, lutSize - 1);
+                        int y1 = std::min(y0 + 1, lutSize - 1);
+                        int z1 = std::min(z0 + 1, lutSize - 1);
+
+                        int i000 = (z0 * size2 + y0 * lutSize + x0) * 3;
+                        int i100 = (z0 * size2 + y0 * lutSize + x1) * 3;
+                        int i010 = (z0 * size2 + y1 * lutSize + x0) * 3;
+                        int i110 = (z0 * size2 + y1 * lutSize + x1) * 3;
+                        int i001 = (z1 * size2 + y0 * lutSize + x0) * 3;
+                        int i101 = (z1 * size2 + y0 * lutSize + x1) * 3;
+                        int i011 = (z1 * size2 + y1 * lutSize + x0) * 3;
+                        int i111 = (z1 * size2 + y1 * lutSize + x1) * 3;
+
+                        c000_R[i] = lut[i000];   c000_G[i] = lut[i000 + 1]; c000_B[i] = lut[i000 + 2];
+                        c100_R[i] = lut[i100];   c100_G[i] = lut[i100 + 1]; c100_B[i] = lut[i100 + 2];
+                        c010_R[i] = lut[i010];   c010_G[i] = lut[i010 + 1]; c010_B[i] = lut[i010 + 2];
+                        c110_R[i] = lut[i110];   c110_G[i] = lut[i110 + 1]; c110_B[i] = lut[i110 + 2];
+                        c001_R[i] = lut[i001];   c001_G[i] = lut[i001 + 1]; c001_B[i] = lut[i001 + 2];
+                        c101_R[i] = lut[i101];   c101_G[i] = lut[i101 + 1]; c101_B[i] = lut[i101 + 2];
+                        c011_R[i] = lut[i011];   c011_G[i] = lut[i011 + 1]; c011_B[i] = lut[i011 + 2];
+                        c111_R[i] = lut[i111];   c111_G[i] = lut[i111 + 1]; c111_B[i] = lut[i111 + 2];
+                    }
+
+                    // RED Channel
+                    float32x4_t mixX0_R = mix_colors(vld1q_f32(c000_R), vld1q_f32(c100_R), dx, inv_dx);
+                    float32x4_t mixX1_R = mix_colors(vld1q_f32(c010_R), vld1q_f32(c110_R), dx, inv_dx);
+                    float32x4_t mixX2_R = mix_colors(vld1q_f32(c001_R), vld1q_f32(c101_R), dx, inv_dx);
+                    float32x4_t mixX3_R = mix_colors(vld1q_f32(c011_R), vld1q_f32(c111_R), dx, inv_dx);
+                    float32x4_t mixY0_R = mix_colors(mixX0_R, mixX1_R, dy, inv_dy);
+                    float32x4_t mixY1_R = mix_colors(mixX2_R, mixX3_R, dy, inv_dy);
+                    float32x4_t final_R = mix_colors(mixY0_R, mixY1_R, dz, inv_dz);
+
+                    // GREEN Channel
+                    float32x4_t mixX0_G = mix_colors(vld1q_f32(c000_G), vld1q_f32(c100_G), dx, inv_dx);
+                    float32x4_t mixX1_G = mix_colors(vld1q_f32(c010_G), vld1q_f32(c110_G), dx, inv_dx);
+                    float32x4_t mixX2_G = mix_colors(vld1q_f32(c001_G), vld1q_f32(c101_G), dx, inv_dx);
+                    float32x4_t mixX3_G = mix_colors(vld1q_f32(c011_G), vld1q_f32(c111_G), dx, inv_dx);
+                    float32x4_t mixY0_G = mix_colors(mixX0_G, mixX1_G, dy, inv_dy);
+                    float32x4_t mixY1_G = mix_colors(mixX2_G, mixX3_G, dy, inv_dy);
+                    float32x4_t final_G = mix_colors(mixY0_G, mixY1_G, dz, inv_dz);
+
+                    // BLUE Channel
+                    float32x4_t mixX0_B = mix_colors(vld1q_f32(c000_B), vld1q_f32(c100_B), dx, inv_dx);
+                    float32x4_t mixX1_B = mix_colors(vld1q_f32(c010_B), vld1q_f32(c110_B), dx, inv_dx);
+                    float32x4_t mixX2_B = mix_colors(vld1q_f32(c001_B), vld1q_f32(c101_B), dx, inv_dx);
+                    float32x4_t mixX3_B = mix_colors(vld1q_f32(c011_B), vld1q_f32(c111_B), dx, inv_dx);
+                    float32x4_t mixY0_B = mix_colors(mixX0_B, mixX1_B, dy, inv_dy);
+                    float32x4_t mixY1_B = mix_colors(mixX2_B, mixX3_B, dy, inv_dy);
+                    float32x4_t final_B = mix_colors(mixY0_B, mixY1_B, dz, inv_dz);
+
+                    //Clamp, Scale, and Pack back into Integers
+                    final_R = vmaxq_f32(vminq_f32(vmulq_f32(final_R, v_255), v_255), v_zero);
+                    final_G = vmaxq_f32(vminq_f32(vmulq_f32(final_G, v_255), v_255), v_zero);
+                    final_B = vmaxq_f32(vminq_f32(vmulq_f32(final_B, v_255), v_255), v_zero);
+
+                    uint32x4_t out_R = vcvtq_u32_f32(final_R);
+                    uint32x4_t out_G = vcvtq_u32_f32(final_G);
+                    uint32x4_t out_B = vcvtq_u32_f32(final_B);
+                    uint32x4_t out_A = vld1q_u32(a_arr);
+
+                    // Reconstruct 4 Pixels
+                    uint32x4_t out_pixels = out_R;
+                    out_pixels = vorrq_u32(out_pixels, vshlq_n_u32(out_G, 8));
+                    out_pixels = vorrq_u32(out_pixels, vshlq_n_u32(out_B, 16));
+                    out_pixels = vorrq_u32(out_pixels, vshlq_n_u32(out_A, 24));
+
+                    vst1q_u32(reinterpret_cast<uint32_t*>(outRow + x), out_pixels);
+                }
+            }
+        });
     }
 
     // Clean up memory
@@ -368,4 +520,270 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEn
 
     auto end = std::chrono::high_resolution_clock::now();
     return static_cast<jdouble>(std::chrono::duration<double, std::milli>(end - start).count());
+}
+
+class GPUProcessor {
+public:
+  static GPUProcessor &getInstance() {
+    static GPUProcessor instance;
+    return instance;
+  }
+
+  void process(uint8_t *inData, uint8_t *outData, int width, int height,
+               int rowStride, float *lut, int lutSize, bool lutChanged) {
+    initEGL();
+    if (eglContext != EGL_NO_CONTEXT && eglGetCurrentContext() != eglContext) {
+      eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+    }
+    initGL(width, height);
+
+    glBindTexture(GL_TEXTURE_2D, frameTex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowStride / 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA,
+                    GL_UNSIGNED_BYTE, inData);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+    if (lut != nullptr && lutSize > 0) {
+      if (lutChanged) {
+        glBindTexture(GL_TEXTURE_3D, lutTex);
+        // Phones don't guarantee linear filtering for GL_RGB32F.
+        // We convert the float LUT to an 8-bit unsigned byte array to guarantee
+        // compatibility & free hardware trilinear filtering.
+        std::vector<uint8_t> lut8(lutSize * lutSize * lutSize * 3);
+        int totalElements = lutSize * lutSize * lutSize * 3;
+        for (int i = 0; i < totalElements; i++) {
+          lut8[i] = static_cast<uint8_t>(
+              std::max(0.0f, std::min(255.0f, lut[i] * 255.0f)));
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT,
+                      1); // VERY CRITICAL for RGB8 textures that may have odd
+                          // dimensions like 33.
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB8, lutSize, lutSize, lutSize, 0,
+                     GL_RGB, GL_UNSIGNED_BYTE, lut8.data());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4); // Reset to default
+        hasLut = true;
+      }
+    } else {
+      hasLut = false;
+    }
+
+    glUseProgram(computeProgram);
+    glUniform1i(glGetUniformLocation(computeProgram, "hasLut"), hasLut ? 1 : 0);
+
+    glBindImageTexture(0, frameTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+    glBindImageTexture(1, outTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_3D, lutTex);
+    glUniform1i(glGetUniformLocation(computeProgram, "lutSampler"), 2);
+
+    GLuint groupX = (width + 15) / 16;
+    GLuint groupY = (height + 15) / 16;
+    glDispatchCompute(groupX, groupY, 1);
+
+    // Wait for the compute shader to finish storing to outTex
+    glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           outTex, 0);
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, width);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, outData);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  }
+
+private:
+  EGLDisplay eglDisplay = EGL_NO_DISPLAY;
+  EGLContext eglContext = EGL_NO_CONTEXT;
+  EGLSurface eglSurface = EGL_NO_SURFACE;
+  bool initialized = false;
+
+  GLuint computeProgram = 0;
+  GLuint frameTex = 0;
+  GLuint outTex = 0;
+  GLuint lutTex = 0;
+  GLuint fbo = 0;
+  int texWidth = 0;
+  int texHeight = 0;
+  bool hasLut = false;
+
+  GPUProcessor() {}
+
+  void initEGL() {
+    if (initialized)
+      return;
+
+    eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(eglDisplay, nullptr, nullptr);
+
+    const EGLint configAttribs[] = {EGL_SURFACE_TYPE,
+                                    EGL_PBUFFER_BIT,
+                                    EGL_RENDERABLE_TYPE,
+                                    EGL_OPENGL_ES2_BIT,
+                                    EGL_RED_SIZE,
+                                    8,
+                                    EGL_GREEN_SIZE,
+                                    8,
+                                    EGL_BLUE_SIZE,
+                                    8,
+                                    EGL_ALPHA_SIZE,
+                                    8,
+                                    EGL_NONE};
+
+    EGLConfig config;
+    EGLint numConfigs;
+    eglChooseConfig(eglDisplay, configAttribs, &config, 1, &numConfigs);
+    if (numConfigs == 0) {
+      const EGLint fallbackAttribs[] = {EGL_NONE};
+      eglChooseConfig(eglDisplay, fallbackAttribs, &config, 1, &numConfigs);
+    }
+
+    const EGLint pbufferAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+    eglSurface = eglCreatePbufferSurface(eglDisplay, config, pbufferAttribs);
+
+    const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    eglContext =
+        eglCreateContext(eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
+
+    eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+
+    initialized = true;
+  }
+
+  void initGL(int w, int h) {
+    if (computeProgram == 0) {
+      const char *shaderSrc = R"(#version 310 es
+                precision mediump float;
+                precision mediump image2D;
+                precision mediump sampler3D;
+
+                layout(local_size_x = 16, local_size_y = 16) in;
+                layout(binding = 0, rgba8) uniform readonly image2D inTexture;
+                layout(binding = 1, rgba8) uniform writeonly image2D outTexture;
+
+                uniform sampler3D lutSampler;
+                uniform int hasLut;
+
+                void main() {
+                    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+                    ivec2 size = imageSize(inTexture);
+                    if (pos.x >= size.x || pos.y >= size.y) return;
+
+                    vec4 color = imageLoad(inTexture, pos);
+                    
+                    if (hasLut == 1) {
+                        vec3 lutColor = texture(lutSampler, color.rgb).rgb;
+                        imageStore(outTexture, pos, vec4(lutColor, color.a));
+                    } else {
+                        imageStore(outTexture, pos, color);
+                    }
+                }
+            )";
+
+      GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+      glShaderSource(shader, 1, &shaderSrc, nullptr);
+      glCompileShader(shader);
+
+      GLint success;
+      glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+      if (!success) {
+        char infoLog[512];
+        glGetShaderInfoLog(shader, 512, nullptr, infoLog);
+        LOGE("Compute Shader Error: %s", infoLog);
+      }
+
+      computeProgram = glCreateProgram();
+      glAttachShader(computeProgram, shader);
+      glLinkProgram(computeProgram);
+      glDeleteShader(shader);
+    }
+
+    if (texWidth != w || texHeight != h) {
+      if (frameTex)
+        glDeleteTextures(1, &frameTex);
+      if (outTex)
+        glDeleteTextures(1, &outTex);
+      if (fbo)
+        glDeleteFramebuffers(1, &fbo);
+
+      glGenTextures(1, &frameTex);
+      glBindTexture(GL_TEXTURE_2D, frameTex);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+      glGenTextures(1, &outTex);
+      glBindTexture(GL_TEXTURE_2D, outTex);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+      glGenFramebuffers(1, &fbo);
+
+      texWidth = w;
+      texHeight = h;
+    }
+
+    if (lutTex == 0) {
+      glGenTextures(1, &lutTex);
+      glBindTexture(GL_TEXTURE_3D, lutTex);
+      // Linear filtering is required for hardware trilinear interpolation
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    }
+  }
+};
+
+static jobject globalLastLutArray = nullptr;
+
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_videoprocessingengine_MainActivity_processFrameNativeGPU(
+    JNIEnv *env, jobject, jobject inRgbaBuf, jobject outRgbaBuf, jint width,
+    jint height, jint rowStride, jfloatArray lutArray, jint lutSize) {
+  auto start = std::chrono::high_resolution_clock::now();
+
+  auto *inData = static_cast<uint8_t *>(env->GetDirectBufferAddress(inRgbaBuf));
+  auto *outData =
+      static_cast<uint8_t *>(env->GetDirectBufferAddress(outRgbaBuf));
+
+  bool lutChanged = false;
+  if (lutArray == nullptr) {
+      if (globalLastLutArray != nullptr) {
+          env->DeleteGlobalRef(globalLastLutArray);
+          globalLastLutArray = nullptr;
+          lutChanged = true;
+      }
+  } else {
+      if (globalLastLutArray == nullptr || !env->IsSameObject(lutArray, globalLastLutArray)) {
+          if (globalLastLutArray != nullptr) {
+              env->DeleteGlobalRef(globalLastLutArray);
+          }
+          globalLastLutArray = env->NewGlobalRef(lutArray);
+          lutChanged = true;
+      }
+  }
+
+  jfloat *lut = nullptr;
+  if (lutArray != nullptr && lutSize > 0) {
+    lut = env->GetFloatArrayElements(lutArray, nullptr);
+  }
+
+  GPUProcessor::getInstance().process(inData, outData, width, height, rowStride,
+                                      lut, lutSize, lutChanged);
+
+  if (lut != nullptr) {
+    env->ReleaseFloatArrayElements(lutArray, lut, JNI_ABORT);
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  return static_cast<jdouble>(
+      std::chrono::duration<double, std::milli>(end - start).count());
 }
