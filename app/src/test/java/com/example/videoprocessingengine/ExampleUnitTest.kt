@@ -14,4 +14,13 @@ class ExampleUnitTest {
     fun addition_isCorrect() {
         assertEquals(4, 2 + 2)
     }
+
+    @Test
+    fun checkProcessingModes() {
+        val modes = MainActivity.ProcessingMode.values()
+        assertTrue(modes.contains(MainActivity.ProcessingMode.BASELINE))
+        assertTrue(modes.contains(MainActivity.ProcessingMode.SIMD))
+        assertTrue(modes.contains(MainActivity.ProcessingMode.GPU))
+        assertTrue(modes.contains(MainActivity.ProcessingMode.HYBRID))
+    }
 }

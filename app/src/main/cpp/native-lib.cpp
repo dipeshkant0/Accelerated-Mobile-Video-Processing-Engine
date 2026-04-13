@@ -529,12 +529,30 @@ public:
     return instance;
   }
 
+  GLint hasLutLoc = -1;
+  GLint lutSamplerLoc = -1;
+
   void process(uint8_t *inData, uint8_t *outData, int width, int height,
-               int rowStride, float *lut, int lutSize, bool lutChanged) {
+               int rowStride, float *lut, int lutSize, bool lutChanged, ANativeWindow* window) {
     initEGL();
-    if (eglContext != EGL_NO_CONTEXT && eglGetCurrentContext() != eglContext) {
-      eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+    
+    if (window != lastWindow) {
+        if (windowEglSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(eglDisplay, windowEglSurface);
+            windowEglSurface = EGL_NO_SURFACE;
+        }
+        if (window != nullptr) {
+            windowEglSurface = eglCreateWindowSurface(eglDisplay, eglConfig, window, nullptr);
+        }
+        lastWindow = window;
     }
+
+    if (windowEglSurface != EGL_NO_SURFACE) {
+        eglMakeCurrent(eglDisplay, windowEglSurface, windowEglSurface, eglContext);
+    } else if (eglContext != EGL_NO_CONTEXT && eglGetCurrentContext() != eglContext) {
+        eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+    }
+
     initGL(width, height);
 
     glBindTexture(GL_TEXTURE_2D, frameTex);
@@ -547,21 +565,16 @@ public:
     if (lut != nullptr && lutSize > 0) {
       if (lutChanged) {
         glBindTexture(GL_TEXTURE_3D, lutTex);
-        // Phones don't guarantee linear filtering for GL_RGB32F.
-        // We convert the float LUT to an 8-bit unsigned byte array to guarantee
-        // compatibility & free hardware trilinear filtering.
         std::vector<uint8_t> lut8(lutSize * lutSize * lutSize * 3);
         int totalElements = lutSize * lutSize * lutSize * 3;
         for (int i = 0; i < totalElements; i++) {
           lut8[i] = static_cast<uint8_t>(
               std::max(0.0f, std::min(255.0f, lut[i] * 255.0f)));
         }
-        glPixelStorei(GL_UNPACK_ALIGNMENT,
-                      1); // VERY CRITICAL for RGB8 textures that may have odd
-                          // dimensions like 33.
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB8, lutSize, lutSize, lutSize, 0,
                      GL_RGB, GL_UNSIGNED_BYTE, lut8.data());
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4); // Reset to default
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         hasLut = true;
       }
     } else {
@@ -569,32 +582,72 @@ public:
     }
 
     glUseProgram(computeProgram);
-    glUniform1i(glGetUniformLocation(computeProgram, "hasLut"), hasLut ? 1 : 0);
+    glUniform1i(hasLutLoc, hasLut ? 1 : 0);
 
     glBindImageTexture(0, frameTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
     glBindImageTexture(1, outTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
 
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_3D, lutTex);
-    glUniform1i(glGetUniformLocation(computeProgram, "lutSampler"), 2);
+    glUniform1i(lutSamplerLoc, 2);
 
     GLuint groupX = (width + 15) / 16;
     GLuint groupY = (height + 15) / 16;
     glDispatchCompute(groupX, groupY, 1);
 
     // Wait for the compute shader to finish storing to outTex
-    glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                           outTex, 0);
+    if (windowEglSurface != EGL_NO_SURFACE) {
+        renderToWindow(window);
+        eglSwapBuffers(eglDisplay, windowEglSurface);
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ROW_LENGTH, width);
+        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, outData);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+  }
 
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glPixelStorei(GL_PACK_ROW_LENGTH, width);
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, outData);
-    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  void renderToWindow(ANativeWindow* window) {
+      int winW = ANativeWindow_getWidth(window);
+      int winH = ANativeWindow_getHeight(window);
+      glViewport(0, 0, winW, winH);
+      glClear(GL_COLOR_BUFFER_BIT);
+      glUseProgram(quadProgram);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, outTex);
+      glUniform1i(glGetUniformLocation(quadProgram, "tex"), 0);
+
+      float windowAspectRatio = static_cast<float>(winW) / static_cast<float>(winH);
+      // The content is rotated 90 degrees, so aspect is H/W
+      float contentAspectRatio = static_cast<float>(texHeight) / static_cast<float>(texWidth);
+
+      float scaleX = 1.0f;
+      float scaleY = 1.0f;
+
+      if (contentAspectRatio > windowAspectRatio) {
+          // Content is wider than window, scale X (crop horizontal)
+          scaleX = contentAspectRatio / windowAspectRatio;
+      } else {
+          // Window is wider than content, scale Y (crop vertical)
+          scaleY = windowAspectRatio / contentAspectRatio;
+      }
+
+      float verts[] = {
+          -scaleX, -scaleY, 0.0f, 0.0f,
+           scaleX, -scaleY, 1.0f, 0.0f,
+          -scaleX,  scaleY, 0.0f, 1.0f,
+           scaleX,  scaleY, 1.0f, 1.0f
+      };
+      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
+      glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts + 2);
+      glEnableVertexAttribArray(0);
+      glEnableVertexAttribArray(1);
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   }
 
 private:
@@ -604,6 +657,7 @@ private:
   bool initialized = false;
 
   GLuint computeProgram = 0;
+  GLuint quadProgram = 0;
   GLuint frameTex = 0;
   GLuint outTex = 0;
   GLuint lutTex = 0;
@@ -611,6 +665,9 @@ private:
   int texWidth = 0;
   int texHeight = 0;
   bool hasLut = false;
+  EGLSurface windowEglSurface = EGL_NO_SURFACE;
+  ANativeWindow* lastWindow = nullptr;
+  EGLConfig eglConfig;
 
   GPUProcessor() {}
 
@@ -622,9 +679,9 @@ private:
     eglInitialize(eglDisplay, nullptr, nullptr);
 
     const EGLint configAttribs[] = {EGL_SURFACE_TYPE,
-                                    EGL_PBUFFER_BIT,
+                                    EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
                                     EGL_RENDERABLE_TYPE,
-                                    EGL_OPENGL_ES2_BIT,
+                                    EGL_OPENGL_ES3_BIT,
                                     EGL_RED_SIZE,
                                     8,
                                     EGL_GREEN_SIZE,
@@ -635,20 +692,15 @@ private:
                                     8,
                                     EGL_NONE};
 
-    EGLConfig config;
     EGLint numConfigs;
-    eglChooseConfig(eglDisplay, configAttribs, &config, 1, &numConfigs);
-    if (numConfigs == 0) {
-      const EGLint fallbackAttribs[] = {EGL_NONE};
-      eglChooseConfig(eglDisplay, fallbackAttribs, &config, 1, &numConfigs);
-    }
+    eglChooseConfig(eglDisplay, configAttribs, &eglConfig, 1, &numConfigs);
 
     const EGLint pbufferAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
-    eglSurface = eglCreatePbufferSurface(eglDisplay, config, pbufferAttribs);
+    eglSurface = eglCreatePbufferSurface(eglDisplay, eglConfig, pbufferAttribs);
 
     const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     eglContext =
-        eglCreateContext(eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
+        eglCreateContext(eglDisplay, eglConfig, EGL_NO_CONTEXT, contextAttribs);
 
     eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
 
@@ -701,6 +753,43 @@ private:
       glAttachShader(computeProgram, shader);
       glLinkProgram(computeProgram);
       glDeleteShader(shader);
+
+      hasLutLoc = glGetUniformLocation(computeProgram, "hasLut");
+      lutSamplerLoc = glGetUniformLocation(computeProgram, "lutSampler");
+    }
+
+    if (quadProgram == 0) {
+        const char* vertSrc = R"(#version 300 es
+            layout(location = 0) in vec2 pos;
+            layout(location = 1) in vec2 uv;
+            out vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(pos, 0.0, 1.0);
+            }
+        )";
+        const char* fragSrc = R"(#version 300 es
+            precision mediump float;
+            uniform sampler2D tex;
+            in vec2 vUv;
+            out vec4 outColor;
+            void main() {
+                // Correct for 90-degree counter-clockwise rotation 
+                // typically provided by Android camera buffers
+                vec2 rotatedUv = vec2(1.0 - vUv.y, 1.0 - vUv.x);
+                outColor = texture(tex, rotatedUv);
+            }
+        )";
+        GLuint vShader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vShader, 1, &vertSrc, nullptr);
+        glCompileShader(vShader);
+        GLuint fShader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fShader, 1, &fragSrc, nullptr);
+        glCompileShader(fShader);
+        quadProgram = glCreateProgram();
+        glAttachShader(quadProgram, vShader);
+        glAttachShader(quadProgram, fShader);
+        glLinkProgram(quadProgram);
     }
 
     if (texWidth != w || texHeight != h) {
@@ -724,6 +813,10 @@ private:
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
       glGenFramebuffers(1, &fbo);
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, outTex, 0);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
       texWidth = w;
       texHeight = h;
@@ -747,7 +840,7 @@ static jobject globalLastLutArray = nullptr;
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_example_videoprocessingengine_MainActivity_processFrameNativeGPU(
     JNIEnv *env, jobject, jobject inRgbaBuf, jobject outRgbaBuf, jint width,
-    jint height, jint rowStride, jfloatArray lutArray, jint lutSize) {
+    jint height, jint rowStride, jfloatArray lutArray, jint lutSize, jobject surface) {
   auto start = std::chrono::high_resolution_clock::now();
 
   auto *inData = static_cast<uint8_t *>(env->GetDirectBufferAddress(inRgbaBuf));
@@ -776,8 +869,17 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNativeGPU(
     lut = env->GetFloatArrayElements(lutArray, nullptr);
   }
 
+  ANativeWindow* window = nullptr;
+  if (surface != nullptr) {
+      window = ANativeWindow_fromSurface(env, surface);
+  }
+
   GPUProcessor::getInstance().process(inData, outData, width, height, rowStride,
-                                      lut, lutSize, lutChanged);
+                                      lut, lutSize, lutChanged, window);
+
+  if (window != nullptr) {
+      ANativeWindow_release(window);
+  }
 
   if (lut != nullptr) {
     env->ReleaseFloatArrayElements(lutArray, lut, JNI_ABORT);
