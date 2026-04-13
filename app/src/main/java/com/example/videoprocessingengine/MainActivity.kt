@@ -1,14 +1,19 @@
 package com.example.videoprocessingengine
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.SurfaceTexture
 import android.os.BatteryManager
 import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
+import android.view.Surface
+import android.view.TextureView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -54,16 +59,33 @@ class MainActivity : AppCompatActivity() {
     private var targetWidth = 1280
     private var targetHeight = 720
     private lateinit var cameraExecutor: ExecutorService
-    
+    private var displaySurface: Surface? = null
+
     // frame processing function in c++
     external fun processFrameNative(inRgba: ByteBuffer, outRgbaBuf: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
     external fun processFrameNativeSIMD(inRgba: ByteBuffer, outRgbaBuf: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
-    external fun processFrameNativeGPU(inRgba: ByteBuffer, outRgbaBuf: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
+    external fun processFrameNativeGPU(inRgba: ByteBuffer, outRgbaBuf: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int, surface: Surface?): Double
+    
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val temp = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+            tempInCelsius = temp / 10.0
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceiver(batteryReceiver)
+        cameraExecutor.shutdown()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        registerReceiver(batteryReceiver, filter)
 
         // Preload all available LUTs exactly once when the app opens
         val bwLutData = LutParser.parseCubeFile(this, "LUTs/BlackAndWhiteLUT.cube")
@@ -87,6 +109,21 @@ class MainActivity : AppCompatActivity() {
             startCamera()
         } else {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+
+        binding.gpuTextureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                displaySurface = Surface(st)
+            }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                displaySurface = Surface(st)
+            }
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                displaySurface?.release()
+                displaySurface = null
+                return true
+            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
     }
     override fun onCreateOptionsMenu(menu: android.view.Menu): Boolean {
@@ -156,17 +193,12 @@ class MainActivity : AppCompatActivity() {
                             )
                         ).build()
                 ).build()
-            binding.processedImageView.rotation = 90f
             imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
                 val width = imageProxy.width
                 val height = imageProxy.height
 
-                // 1. Fetch live Battery Temperature
-                val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-                val batteryStatus = registerReceiver(null, intentFilter)
-                val temp = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
-                tempInCelsius = temp / 10.0
-
+                // 1. Battery Temperature is now updated via BroadcastReceiver
+                
                 val currentTimestamp = System.currentTimeMillis()
                 val currentCpuTime = android.os.Debug.threadCpuTimeNanos()
 
@@ -231,7 +263,8 @@ class MainActivity : AppCompatActivity() {
                         height,
                         imageProxy.planes[0].rowStride,
                         currentLUT,
-                        lutSize
+                        lutSize,
+                        displaySurface
                     )
                 } else {
                     processFrameNative(
@@ -251,20 +284,28 @@ class MainActivity : AppCompatActivity() {
 
                 rgbaBuffer!!.rewind()
 
-                // Convert the raw returned buffer into a Bitmap so the screen can show it
-                if (reusableBitmap == null || reusableBitmap!!.width != width || reusableBitmap!!.height != height) {
-                    reusableBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                if (currentMode != ProcessingMode.GPU) {
+                    // Convert the raw returned buffer into a Bitmap so the screen can show it
+                    if (reusableBitmap == null || reusableBitmap!!.width != width || reusableBitmap!!.height != height) {
+                        reusableBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    }
+                    reusableBitmap!!.copyPixelsFromBuffer(rgbaBuffer!!)
                 }
 
-                reusableBitmap!!.copyPixelsFromBuffer(rgbaBuffer!!)
-
-//                val matrix = Matrix().apply { postRotate(90f) }
-//                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, false)
-
-
                 runOnUiThread {
-                    // render Frame
-                    binding.processedImageView.setImageBitmap(reusableBitmap)
+                    if (currentMode == ProcessingMode.GPU) {
+                        binding.gpuTextureView.visibility = android.view.View.VISIBLE
+                        binding.processedImageView.visibility = android.view.View.GONE
+                    } else {
+                        binding.gpuTextureView.visibility = android.view.View.GONE
+                        binding.processedImageView.visibility = android.view.View.VISIBLE
+
+                        // Rotate the bitmap for portrait display
+                        val matrix = Matrix()
+                        matrix.postRotate(90f)
+                        val rotatedBitmap = Bitmap.createBitmap(reusableBitmap!!, 0, 0, width, height, matrix, false)
+                        binding.processedImageView.setImageBitmap(rotatedBitmap)
+                    }
                     frameCount++
                     //update data
                     binding.modeLabel.text = "MODE: ${currentMode.name} | RES: ${targetHeight}p"

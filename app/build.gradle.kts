@@ -15,6 +15,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        ndk {
+            abiFilters.add("arm64-v8a")
+        }
         externalNativeBuild {
             cmake {
                 // -O3 enables high-level optimization for your SIMD code
@@ -24,6 +27,12 @@ android {
                 // Target specifically the 64-bit architecture of your phone
                 abiFilters("arm64-v8a")
             }
+        }
+    }
+
+    splits {
+        abi {
+            isEnable = false
         }
     }
 
