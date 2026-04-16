@@ -12,6 +12,9 @@
             <item
                 android:id="@+id/mode_gpu"
                 android:title="GPU (OpenCL)" />
+            <item
+                android:id="@+id/mode_hybrid"
+                android:title="Hybrid (CPU+GPU)" />
         </group>
     </menu>
 </item>

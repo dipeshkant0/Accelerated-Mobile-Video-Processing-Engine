@@ -10,7 +10,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
-
+#include <android/log.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
 
 // Sigleton design pattern for Thread Pool
 class ThreadPool {
@@ -166,159 +168,8 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNative(JNIEnv* e
                 outRow[pos+3] = a;
             }
         }
-        ThreadPool::getInstance().executeAndWait(tasks);
-        auto end = std::chrono::high_resolution_clock::now();
-        return static_cast<jdouble>(std::chrono::duration<double, std::milli>(end - start).count());
     }
 
-    float max_index = static_cast<float>(std::max(lutSize - 1, 1));
-    int size2 = lutSize * lutSize;
-
-    float32x4_t v_max_index = vdupq_n_f32(max_index);
-    float32x4_t v_255_inv   = vdupq_n_f32(1.0f / 255.0f);
-    float32x4_t v_255       = vdupq_n_f32(255.0f);
-    float32x4_t v_one       = vdupq_n_f32(1.0f);
-    float32x4_t v_zero      = vdupq_n_f32(0.0f);
-
-    // SIMD Helper function for Fused-Multiply-Add (FMA) Interpolation
-    auto mix_colors = [](float32x4_t c0, float32x4_t c1, float32x4_t d, float32x4_t inv_d) {
-        return vmlaq_f32(vmulq_f32(inv_d, c0), d, c1);
-    };
-
-
-    // Spawn the threads
-    for (int t = 0; t < num_threads; t++) {
-        // We use [=] to pass all our SIMD constants and pointers into the thread safely
-        tasks.emplace_back([=]() {
-
-            // Calculate which rows this specific core will process
-            int start_y = t * chunk_size;
-            int end_y = (t == num_threads - 1) ? height : start_y + chunk_size;
-
-            for (int y = start_y; y < end_y; y++) {
-                uint8_t* inRow = inData + (y * rowStride);
-                uint8_t* outRow = outData + (y * width * 4);
-
-                int x = 0;
-                // Process 4 pixels (16 bytes) at a time
-                for (; x <= (width - 4) * 4; x += 16) {
-                    uint8_t *p = inRow + x;
-
-                    //Extract R, G, B, A for 4 pixels
-                    uint32_t r_arr[4] = {p[0], p[4], p[8], p[12]};
-                    uint32_t g_arr[4] = {p[1], p[5], p[9], p[13]};
-                    uint32_t b_arr[4] = {p[2], p[6], p[10], p[14]};
-                    uint32_t a_arr[4] = {p[3], p[7], p[11], p[15]};
-
-                    // Load into SIMD Float Vectors
-                    float32x4_t r_f = vcvtq_f32_u32(vld1q_u32(r_arr));
-                    float32x4_t g_f = vcvtq_f32_u32(vld1q_u32(g_arr));
-                    float32x4_t b_f = vcvtq_f32_u32(vld1q_u32(b_arr));
-
-                    // Normalize (0.0 - 1.0) and multiply by max_index
-                    float32x4_t lutX = vmulq_f32(vmulq_f32(r_f, v_255_inv), v_max_index);
-                    float32x4_t lutY = vmulq_f32(vmulq_f32(g_f, v_255_inv), v_max_index);
-                    float32x4_t lutZ = vmulq_f32(vmulq_f32(b_f, v_255_inv), v_max_index);
-
-                    //Get Base Grid Coordinates (x0, y0, z0)
-                    uint32x4_t x0_u = vcvtq_u32_f32(lutX);
-                    uint32x4_t y0_u = vcvtq_u32_f32(lutY);
-                    uint32x4_t z0_u = vcvtq_u32_f32(lutZ);
-
-                    //Get Distances (dx, dy, dz) & Inverted Distances
-                    float32x4_t dx = vsubq_f32(lutX, vcvtq_f32_u32(x0_u));
-                    float32x4_t dy = vsubq_f32(lutY, vcvtq_f32_u32(y0_u));
-                    float32x4_t dz = vsubq_f32(lutZ, vcvtq_f32_u32(z0_u));
-
-                    float32x4_t inv_dx = vsubq_f32(v_one, dx);
-                    float32x4_t inv_dy = vsubq_f32(v_one, dy);
-                    float32x4_t inv_dz = vsubq_f32(v_one, dz);
-
-                    //Calculate memory indices and gather LUT floats
-                    uint32_t x0_arr[4], y0_arr[4], z0_arr[4];
-                    vst1q_u32(x0_arr, x0_u);
-                    vst1q_u32(y0_arr, y0_u);
-                    vst1q_u32(z0_arr, z0_u);
-
-                    float c000_R[4], c100_R[4], c010_R[4], c110_R[4], c001_R[4], c101_R[4], c011_R[4], c111_R[4];
-                    float c000_G[4], c100_G[4], c010_G[4], c110_G[4], c001_G[4], c101_G[4], c011_G[4], c111_G[4];
-                    float c000_B[4], c100_B[4], c010_B[4], c110_B[4], c001_B[4], c101_B[4], c011_B[4], c111_B[4];
-
-                    for (int i = 0; i < 4; i++) {
-                        int x0 = x0_arr[i]; int y0 = y0_arr[i]; int z0 = z0_arr[i];
-                        int x1 = std::min(x0 + 1, lutSize - 1);
-                        int y1 = std::min(y0 + 1, lutSize - 1);
-                        int z1 = std::min(z0 + 1, lutSize - 1);
-
-                        int i000 = (z0 * size2 + y0 * lutSize + x0) * 3;
-                        int i100 = (z0 * size2 + y0 * lutSize + x1) * 3;
-                        int i010 = (z0 * size2 + y1 * lutSize + x0) * 3;
-                        int i110 = (z0 * size2 + y1 * lutSize + x1) * 3;
-                        int i001 = (z1 * size2 + y0 * lutSize + x0) * 3;
-                        int i101 = (z1 * size2 + y0 * lutSize + x1) * 3;
-                        int i011 = (z1 * size2 + y1 * lutSize + x0) * 3;
-                        int i111 = (z1 * size2 + y1 * lutSize + x1) * 3;
-
-                        c000_R[i] = lut[i000];   c000_G[i] = lut[i000 + 1]; c000_B[i] = lut[i000 + 2];
-                        c100_R[i] = lut[i100];   c100_G[i] = lut[i100 + 1]; c100_B[i] = lut[i100 + 2];
-                        c010_R[i] = lut[i010];   c010_G[i] = lut[i010 + 1]; c010_B[i] = lut[i010 + 2];
-                        c110_R[i] = lut[i110];   c110_G[i] = lut[i110 + 1]; c110_B[i] = lut[i110 + 2];
-                        c001_R[i] = lut[i001];   c001_G[i] = lut[i001 + 1]; c001_B[i] = lut[i001 + 2];
-                        c101_R[i] = lut[i101];   c101_G[i] = lut[i101 + 1]; c101_B[i] = lut[i101 + 2];
-                        c011_R[i] = lut[i011];   c011_G[i] = lut[i011 + 1]; c011_B[i] = lut[i011 + 2];
-                        c111_R[i] = lut[i111];   c111_G[i] = lut[i111 + 1]; c111_B[i] = lut[i111 + 2];
-                    }
-
-                    // RED Channel
-                    float32x4_t mixX0_R = mix_colors(vld1q_f32(c000_R), vld1q_f32(c100_R), dx, inv_dx);
-                    float32x4_t mixX1_R = mix_colors(vld1q_f32(c010_R), vld1q_f32(c110_R), dx, inv_dx);
-                    float32x4_t mixX2_R = mix_colors(vld1q_f32(c001_R), vld1q_f32(c101_R), dx, inv_dx);
-                    float32x4_t mixX3_R = mix_colors(vld1q_f32(c011_R), vld1q_f32(c111_R), dx, inv_dx);
-                    float32x4_t mixY0_R = mix_colors(mixX0_R, mixX1_R, dy, inv_dy);
-                    float32x4_t mixY1_R = mix_colors(mixX2_R, mixX3_R, dy, inv_dy);
-                    float32x4_t final_R = mix_colors(mixY0_R, mixY1_R, dz, inv_dz);
-
-                    // GREEN Channel
-                    float32x4_t mixX0_G = mix_colors(vld1q_f32(c000_G), vld1q_f32(c100_G), dx, inv_dx);
-                    float32x4_t mixX1_G = mix_colors(vld1q_f32(c010_G), vld1q_f32(c110_G), dx, inv_dx);
-                    float32x4_t mixX2_G = mix_colors(vld1q_f32(c001_G), vld1q_f32(c101_G), dx, inv_dx);
-                    float32x4_t mixX3_G = mix_colors(vld1q_f32(c011_G), vld1q_f32(c111_G), dx, inv_dx);
-                    float32x4_t mixY0_G = mix_colors(mixX0_G, mixX1_G, dy, inv_dy);
-                    float32x4_t mixY1_G = mix_colors(mixX2_G, mixX3_G, dy, inv_dy);
-                    float32x4_t final_G = mix_colors(mixY0_G, mixY1_G, dz, inv_dz);
-
-                    // BLUE Channel
-                    float32x4_t mixX0_B = mix_colors(vld1q_f32(c000_B), vld1q_f32(c100_B), dx, inv_dx);
-                    float32x4_t mixX1_B = mix_colors(vld1q_f32(c010_B), vld1q_f32(c110_B), dx, inv_dx);
-                    float32x4_t mixX2_B = mix_colors(vld1q_f32(c001_B), vld1q_f32(c101_B), dx, inv_dx);
-                    float32x4_t mixX3_B = mix_colors(vld1q_f32(c011_B), vld1q_f32(c111_B), dx, inv_dx);
-                    float32x4_t mixY0_B = mix_colors(mixX0_B, mixX1_B, dy, inv_dy);
-                    float32x4_t mixY1_B = mix_colors(mixX2_B, mixX3_B, dy, inv_dy);
-                    float32x4_t final_B = mix_colors(mixY0_B, mixY1_B, dz, inv_dz);
-
-                    //Clamp, Scale, and Pack back into Integers
-                    final_R = vmaxq_f32(vminq_f32(vmulq_f32(final_R, v_255), v_255), v_zero);
-                    final_G = vmaxq_f32(vminq_f32(vmulq_f32(final_G, v_255), v_255), v_zero);
-                    final_B = vmaxq_f32(vminq_f32(vmulq_f32(final_B, v_255), v_255), v_zero);
-
-                    uint32x4_t out_R = vcvtq_u32_f32(final_R);
-                    uint32x4_t out_G = vcvtq_u32_f32(final_G);
-                    uint32x4_t out_B = vcvtq_u32_f32(final_B);
-                    uint32x4_t out_A = vld1q_u32(a_arr);
-
-                    // Reconstruct 4 Pixels
-                    uint32x4_t out_pixels = out_R;
-                    out_pixels = vorrq_u32(out_pixels, vshlq_n_u32(out_G, 8));
-                    out_pixels = vorrq_u32(out_pixels, vshlq_n_u32(out_B, 16));
-                    out_pixels = vorrq_u32(out_pixels, vshlq_n_u32(out_A, 24));
-
-                    vst1q_u32(reinterpret_cast<uint32_t*>(outRow + x), out_pixels);
-                }
-            }
-        });
-    }
-
-    // Clean up memory
     if (lut != nullptr) {
         env->ReleaseFloatArrayElements(lutArray, lut, JNI_ABORT);
     }
@@ -522,129 +373,190 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNativeSIMD(JNIEn
     return static_cast<jdouble>(std::chrono::duration<double, std::milli>(end - start).count());
 }
 
+// ===================================================================================
+// THIS CLASS HANDLES ALL THE GPU HEAVY LIFTING
+// We use a Singleton so we don't have to keep creating the OpenGL context
+// ===================================================================================
 class GPUProcessor {
 public:
   static GPUProcessor &getInstance() {
-    static GPUProcessor instance;
-    return instance;
+    static GPUProcessor myInstance;
+    return myInstance;
   }
 
+  // Locations for our shader variables
   GLint hasLutLoc = -1;
   GLint lutSamplerLoc = -1;
 
-  void process(uint8_t *inData, uint8_t *outData, int width, int height,
-               int rowStride, float *lut, int lutSize, bool lutChanged, ANativeWindow* window) {
-    initEGL();
+  // The main function that does the work!
+  void process(uint8_t *cameraData, uint8_t *outputData, int imgWidth, int imgHeight,
+               int rowStride, float *lutData, int lutSize, bool lutWasChanged, jobject androidSurface, JNIEnv* jniEnv) {
     
-    if (window != lastWindow) {
+    // Make sure EGL is ready to go
+    setupEglContext();
+    
+    // ---------------------------------------------------------------------------------
+    // SURFACE CACHING LOGIC
+    // We check if the surface is the same one we used last time to avoid slow recreations
+    // ---------------------------------------------------------------------------------
+    bool needsNewSurface = false;
+    if (androidSurface == nullptr) {
+        if (cachedSurfaceRef != nullptr) {
+            needsNewSurface = true;
+            freeOldWindow(jniEnv);
+        }
+    } else {
+        // If it's a new surface object, we need to update our references
+        if (cachedSurfaceRef == nullptr || !jniEnv->IsSameObject(androidSurface, cachedSurfaceRef)) {
+            needsNewSurface = true;
+            freeOldWindow(jniEnv);
+            cachedSurfaceRef = jniEnv->NewGlobalRef(androidSurface);
+            cachedWindow = ANativeWindow_fromSurface(jniEnv, androidSurface);
+        }
+    }
+
+    if (needsNewSurface) {
+        // Destroy the old surface if it exists
         if (windowEglSurface != EGL_NO_SURFACE) {
             eglDestroySurface(eglDisplay, windowEglSurface);
             windowEglSurface = EGL_NO_SURFACE;
         }
-        if (window != nullptr) {
-            windowEglSurface = eglCreateWindowSurface(eglDisplay, eglConfig, window, nullptr);
+        // Create the new surface for the current window
+        if (cachedWindow != nullptr) {
+            windowEglSurface = eglCreateWindowSurface(eglDisplay, eglConfig, cachedWindow, nullptr);
         }
-        lastWindow = window;
     }
 
+    // Tell OpenGL to use our surface
     if (windowEglSurface != EGL_NO_SURFACE) {
         eglMakeCurrent(eglDisplay, windowEglSurface, windowEglSurface, eglContext);
     } else if (eglContext != EGL_NO_CONTEXT && eglGetCurrentContext() != eglContext) {
         eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
     }
 
-    initGL(width, height);
+    // Initialize shaders and textures if needed
+    prepareGlResources(imgWidth, imgHeight);
 
-    glBindTexture(GL_TEXTURE_2D, frameTex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowStride / 4);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA,
-                    GL_UNSIGNED_BYTE, inData);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    // ---------------------------------------------------------------------------------
+    // ASYNCHRONOUS DATA UPLOAD (Using PBOs)
+    // This part is tricky: we use two buffers so the CPU doesn't have to wait for the GPU
+    // ---------------------------------------------------------------------------------
+    int currentPbo = pboUploadBuffers[pboToggleIndex]; 
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, currentPbo);
 
-    if (lut != nullptr && lutSize > 0) {
-      if (lutChanged) {
-        glBindTexture(GL_TEXTURE_3D, lutTex);
-        std::vector<uint8_t> lut8(lutSize * lutSize * lutSize * 3);
-        int totalElements = lutSize * lutSize * lutSize * 3;
-        for (int i = 0; i < totalElements; i++) {
-          lut8[i] = static_cast<uint8_t>(
-              std::max(0.0f, std::min(255.0f, lut[i] * 255.0f)));
-        }
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB8, lutSize, lutSize, lutSize, 0,
-                     GL_RGB, GL_UNSIGNED_BYTE, lut8.data());
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        hasLut = true;
-      }
-    } else {
-      hasLut = false;
+    // Map the GPU memory so we can copy the camera pixels into it
+    void* gpuBufferPtr = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, imgWidth * imgHeight * 4, 
+                                         GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    
+    if (gpuBufferPtr != nullptr) {
+        // Copy the raw bytes from the camera into the PBO
+        memcpy(gpuBufferPtr, cameraData, imgWidth * imgHeight * 4);
+        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
     }
 
-    glUseProgram(computeProgram);
-    glUniform1i(hasLutLoc, hasLut ? 1 : 0);
+    // Start the transfer from PBO to the actual texture
+    glBindTexture(GL_TEXTURE_2D, frameTexture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, imgWidth, imgHeight, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+    
+    // Unbind the buffer and flip the index for the next frame
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    pboToggleIndex = (pboToggleIndex + 1) % 2;
 
-    glBindImageTexture(0, frameTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
-    glBindImageTexture(1, outTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    // ---------------------------------------------------------------------------------
+    // LUT PROCESSING
+    // ---------------------------------------------------------------------------------
+    if (lutData != nullptr && lutSize > 0) {
+      if (lutWasChanged) {
+        glBindTexture(GL_TEXTURE_3D, lutTexture);
+        
+        // Convert the float LUT to bytes for the shader
+        std::vector<uint8_t> lutBytes(lutSize * lutSize * lutSize * 3);
+        int totalPoints = lutSize * lutSize * lutSize * 3;
+        for (int i = 0; i < totalPoints; i++) {
+          lutBytes[i] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, lutData[i] * 255.0f)));
+        }
+        
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB8, lutSize, lutSize, lutSize, 0,
+                     GL_RGB, GL_UNSIGNED_BYTE, lutBytes.data());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        isLutActive = true;
+      }
+    } else {
+      isLutActive = false;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // RUN THE COMPUTE SHADER
+    // ---------------------------------------------------------------------------------
+    glUseProgram(computeProgramId);
+    glUniform1i(hasLutLoc, isLutActive ? 1 : 0);
+
+    glBindImageTexture(0, frameTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+    glBindImageTexture(1, outputTexture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
 
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_3D, lutTex);
+    glBindTexture(GL_TEXTURE_3D, lutTexture);
     glUniform1i(lutSamplerLoc, 2);
 
-    GLuint groupX = (width + 15) / 16;
-    GLuint groupY = (height + 15) / 16;
-    glDispatchCompute(groupX, groupY, 1);
+    // Calculate how many thread groups we need
+    GLuint groupsX = (imgWidth + 15) / 16;
+    GLuint groupsY = (imgHeight + 15) / 16;
+    glDispatchCompute(groupsX, groupsY, 1);
 
-    // Wait for the compute shader to finish storing to outTex
+    // Tell the GPU to finish writing before we try to read it
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
+    // Show the result on the screen!
     if (windowEglSurface != EGL_NO_SURFACE) {
-        renderToWindow(window);
+        drawResultToWindow(cachedWindow);
         eglSwapBuffers(eglDisplay, windowEglSurface);
     } else {
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        // Fallback: Read the pixels back to the CPU (this is slow!)
+        glBindFramebuffer(GL_FRAMEBUFFER, framebufferId);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        glPixelStorei(GL_PACK_ROW_LENGTH, width);
-        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, outData);
+        glPixelStorei(GL_PACK_ROW_LENGTH, imgWidth);
+        glReadPixels(0, 0, imgWidth, imgHeight, GL_RGBA, GL_UNSIGNED_BYTE, outputData);
         glPixelStorei(GL_PACK_ROW_LENGTH, 0);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
   }
 
-  void renderToWindow(ANativeWindow* window) {
-      int winW = ANativeWindow_getWidth(window);
-      int winH = ANativeWindow_getHeight(window);
-      glViewport(0, 0, winW, winH);
+  // Helper to draw the final processed frame
+  void drawResultToWindow(ANativeWindow* myWindow) {
+      int w = ANativeWindow_getWidth(myWindow);
+      int h = ANativeWindow_getHeight(myWindow);
+      glViewport(0, 0, w, h);
       glClear(GL_COLOR_BUFFER_BIT);
-      glUseProgram(quadProgram);
+      glUseProgram(quadProgramId);
       glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, outTex);
-      glUniform1i(glGetUniformLocation(quadProgram, "tex"), 0);
+      glBindTexture(GL_TEXTURE_2D, outputTexture);
+      glUniform1i(glGetUniformLocation(quadProgramId, "tex"), 0);
 
-      float windowAspectRatio = static_cast<float>(winW) / static_cast<float>(winH);
-      // The content is rotated 90 degrees, so aspect is H/W
-      float contentAspectRatio = static_cast<float>(texHeight) / static_cast<float>(texWidth);
+      // Simple math to make sure the video fits the screen correctly
+      float winRatio = static_cast<float>(w) / static_cast<float>(h);
+      float contentRatio = static_cast<float>(textureHeight) / static_cast<float>(textureWidth);
 
-      float scaleX = 1.0f;
-      float scaleY = 1.0f;
+      float sx = 1.0f;
+      float sy = 1.0f;
 
-      if (contentAspectRatio > windowAspectRatio) {
-          // Content is wider than window, scale X (crop horizontal)
-          scaleX = contentAspectRatio / windowAspectRatio;
+      if (contentRatio > winRatio) {
+          sx = contentRatio / winRatio;
       } else {
-          // Window is wider than content, scale Y (crop vertical)
-          scaleY = windowAspectRatio / contentAspectRatio;
+          sy = winRatio / contentRatio;
       }
 
-      float verts[] = {
-          -scaleX, -scaleY, 0.0f, 0.0f,
-           scaleX, -scaleY, 1.0f, 0.0f,
-          -scaleX,  scaleY, 0.0f, 1.0f,
-           scaleX,  scaleY, 1.0f, 1.0f
+      float vertices[] = {
+          -sx, -sy, 0.0f, 0.0f,
+           sx, -sy, 1.0f, 0.0f,
+          -sx,  sy, 0.0f, 1.0f,
+           sx,  sy, 1.0f, 1.0f
       };
-      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
-      glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts + 2);
+      
+      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), vertices);
+      glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), vertices + 2);
       glEnableVertexAttribArray(0);
       glEnableVertexAttribArray(1);
       glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -654,62 +566,69 @@ private:
   EGLDisplay eglDisplay = EGL_NO_DISPLAY;
   EGLContext eglContext = EGL_NO_CONTEXT;
   EGLSurface eglSurface = EGL_NO_SURFACE;
-  bool initialized = false;
+  bool isInitialized = false;
 
-  GLuint computeProgram = 0;
-  GLuint quadProgram = 0;
-  GLuint frameTex = 0;
-  GLuint outTex = 0;
-  GLuint lutTex = 0;
-  GLuint fbo = 0;
-  int texWidth = 0;
-  int texHeight = 0;
-  bool hasLut = false;
+  GLuint computeProgramId = 0;
+  GLuint quadProgramId = 0;
+  GLuint frameTexture = 0;
+  GLuint outputTexture = 0;
+  GLuint lutTexture = 0;
+  GLuint framebufferId = 0;
+  GLuint pboUploadBuffers[2] = {0, 0};
+  int pboToggleIndex = 0;
+  int textureWidth = 0;
+  int textureHeight = 0;
+  bool isLutActive = false;
   EGLSurface windowEglSurface = EGL_NO_SURFACE;
-  ANativeWindow* lastWindow = nullptr;
   EGLConfig eglConfig;
+  jobject cachedSurfaceRef = nullptr;
+  ANativeWindow* cachedWindow = nullptr;
 
   GPUProcessor() {}
 
-  void initEGL() {
-    if (initialized)
-      return;
+  // Clean up the window if it's being closed or changed
+  void freeOldWindow(JNIEnv* env) {
+      if (cachedWindow != nullptr) {
+          ANativeWindow_release(cachedWindow);
+          cachedWindow = nullptr;
+      }
+      if (cachedSurfaceRef != nullptr && env != nullptr) {
+          env->DeleteGlobalRef(cachedSurfaceRef);
+          cachedSurfaceRef = nullptr;
+      }
+  }
+
+  // Setup the basic EGL context for OpenGL ES 3.1
+  void setupEglContext() {
+    if (isInitialized) return;
 
     eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     eglInitialize(eglDisplay, nullptr, nullptr);
 
-    const EGLint configAttribs[] = {EGL_SURFACE_TYPE,
-                                    EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
-                                    EGL_RENDERABLE_TYPE,
-                                    EGL_OPENGL_ES3_BIT,
-                                    EGL_RED_SIZE,
-                                    8,
-                                    EGL_GREEN_SIZE,
-                                    8,
-                                    EGL_BLUE_SIZE,
-                                    8,
-                                    EGL_ALPHA_SIZE,
-                                    8,
-                                    EGL_NONE};
+    const EGLint attribs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
 
-    EGLint numConfigs;
-    eglChooseConfig(eglDisplay, configAttribs, &eglConfig, 1, &numConfigs);
+    EGLint configsFound;
+    eglChooseConfig(eglDisplay, attribs, &eglConfig, 1, &configsFound);
 
     const EGLint pbufferAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     eglSurface = eglCreatePbufferSurface(eglDisplay, eglConfig, pbufferAttribs);
 
     const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-    eglContext =
-        eglCreateContext(eglDisplay, eglConfig, EGL_NO_CONTEXT, contextAttribs);
+    eglContext = eglCreateContext(eglDisplay, eglConfig, EGL_NO_CONTEXT, contextAttribs);
 
     eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
-
-    initialized = true;
+    isInitialized = true;
   }
 
-  void initGL(int w, int h) {
-    if (computeProgram == 0) {
-      const char *shaderSrc = R"(#version 310 es
+  // Setup our shaders, textures, and buffers
+  void prepareGlResources(int w, int h) {
+    if (computeProgramId == 0) {
+      const char *csSource = R"(#version 310 es
                 precision mediump float;
                 precision mediump image2D;
                 precision mediump sampler3D;
@@ -738,28 +657,20 @@ private:
             )";
 
       GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
-      glShaderSource(shader, 1, &shaderSrc, nullptr);
+      glShaderSource(shader, 1, &csSource, nullptr);
       glCompileShader(shader);
 
-      GLint success;
-      glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-      if (!success) {
-        char infoLog[512];
-        glGetShaderInfoLog(shader, 512, nullptr, infoLog);
-        LOGE("Compute Shader Error: %s", infoLog);
-      }
-
-      computeProgram = glCreateProgram();
-      glAttachShader(computeProgram, shader);
-      glLinkProgram(computeProgram);
+      computeProgramId = glCreateProgram();
+      glAttachShader(computeProgramId, shader);
+      glLinkProgram(computeProgramId);
       glDeleteShader(shader);
 
-      hasLutLoc = glGetUniformLocation(computeProgram, "hasLut");
-      lutSamplerLoc = glGetUniformLocation(computeProgram, "lutSampler");
+      hasLutLoc = glGetUniformLocation(computeProgramId, "hasLut");
+      lutSamplerLoc = glGetUniformLocation(computeProgramId, "lutSampler");
     }
 
-    if (quadProgram == 0) {
-        const char* vertSrc = R"(#version 300 es
+    if (quadProgramId == 0) {
+        const char* vsSource = R"(#version 300 es
             layout(location = 0) in vec2 pos;
             layout(location = 1) in vec2 uv;
             out vec2 vUv;
@@ -768,64 +679,64 @@ private:
                 gl_Position = vec4(pos, 0.0, 1.0);
             }
         )";
-        const char* fragSrc = R"(#version 300 es
+        const char* fsSource = R"(#version 300 es
             precision mediump float;
             uniform sampler2D tex;
             in vec2 vUv;
             out vec4 outColor;
             void main() {
-                // Correct for 90-degree counter-clockwise rotation 
-                // typically provided by Android camera buffers
+                // Fix the rotation for mobile camera
                 vec2 rotatedUv = vec2(1.0 - vUv.y, 1.0 - vUv.x);
                 outColor = texture(tex, rotatedUv);
             }
         )";
-        GLuint vShader = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vShader, 1, &vertSrc, nullptr);
-        glCompileShader(vShader);
-        GLuint fShader = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fShader, 1, &fragSrc, nullptr);
-        glCompileShader(fShader);
-        quadProgram = glCreateProgram();
-        glAttachShader(quadProgram, vShader);
-        glAttachShader(quadProgram, fShader);
-        glLinkProgram(quadProgram);
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vs, 1, &vsSource, nullptr);
+        glCompileShader(vs);
+        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fs, 1, &fsSource, nullptr);
+        glCompileShader(fs);
+        quadProgramId = glCreateProgram();
+        glAttachShader(quadProgramId, vs);
+        glAttachShader(quadProgramId, fs);
+        glLinkProgram(quadProgramId);
     }
 
-    if (texWidth != w || texHeight != h) {
-      if (frameTex)
-        glDeleteTextures(1, &frameTex);
-      if (outTex)
-        glDeleteTextures(1, &outTex);
-      if (fbo)
-        glDeleteFramebuffers(1, &fbo);
+    // Allocate textures and PBOs if the resolution changed
+    if (textureWidth != w || textureHeight != h) {
+      if (frameTexture) glDeleteTextures(1, &frameTexture);
+      if (outputTexture) glDeleteTextures(1, &outputTexture);
+      if (framebufferId) glDeleteFramebuffers(1, &framebufferId);
+      if (pboUploadBuffers[0]) glDeleteBuffers(2, pboUploadBuffers);
 
-      glGenTextures(1, &frameTex);
-      glBindTexture(GL_TEXTURE_2D, frameTex);
+      glGenTextures(1, &frameTexture);
+      glBindTexture(GL_TEXTURE_2D, frameTexture);
       glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-      glGenTextures(1, &outTex);
-      glBindTexture(GL_TEXTURE_2D, outTex);
+      glGenTextures(1, &outputTexture);
+      glBindTexture(GL_TEXTURE_2D, outputTexture);
       glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-      glGenFramebuffers(1, &fbo);
-      glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                             GL_TEXTURE_2D, outTex, 0);
+      glGenFramebuffers(1, &framebufferId);
+      glBindFramebuffer(GL_FRAMEBUFFER, framebufferId);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, outputTexture, 0);
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-      texWidth = w;
-      texHeight = h;
+      // Setup the Pixel Buffer Objects for smooth uploads
+      glGenBuffers(2, pboUploadBuffers);
+      for(int i = 0; i < 2; i++) {
+          glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pboUploadBuffers[i]);
+          glBufferData(GL_PIXEL_UNPACK_BUFFER, w * h * 4, nullptr, GL_STREAM_DRAW);
+      }
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+      textureWidth = w;
+      textureHeight = h;
     }
 
-    if (lutTex == 0) {
-      glGenTextures(1, &lutTex);
-      glBindTexture(GL_TEXTURE_3D, lutTex);
-      // Linear filtering is required for hardware trilinear interpolation
+    if (lutTexture == 0) {
+      glGenTextures(1, &lutTexture);
+      glBindTexture(GL_TEXTURE_3D, lutTexture);
       glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -837,22 +748,27 @@ private:
 
 static jobject globalLastLutArray = nullptr;
 
+// ---------------------------------------------------------------------------------
+// JNI BRIDGE FOR GPU PROCESSING
+// ---------------------------------------------------------------------------------
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_example_videoprocessingengine_MainActivity_processFrameNativeGPU(
     JNIEnv *env, jobject, jobject inRgbaBuf, jobject outRgbaBuf, jint width,
     jint height, jint rowStride, jfloatArray lutArray, jint lutSize, jobject surface) {
+  
   auto start = std::chrono::high_resolution_clock::now();
 
-  auto *inData = static_cast<uint8_t *>(env->GetDirectBufferAddress(inRgbaBuf));
-  auto *outData =
-      static_cast<uint8_t *>(env->GetDirectBufferAddress(outRgbaBuf));
+  // Get the raw memory addresses
+  auto *inPtr = static_cast<uint8_t *>(env->GetDirectBufferAddress(inRgbaBuf));
+  auto *outPtr = static_cast<uint8_t *>(env->GetDirectBufferAddress(outRgbaBuf));
 
-  bool lutChanged = false;
+  // Check if the LUT has changed since last time
+  bool lutNeedsUpdate = false;
   if (lutArray == nullptr) {
       if (globalLastLutArray != nullptr) {
           env->DeleteGlobalRef(globalLastLutArray);
           globalLastLutArray = nullptr;
-          lutChanged = true;
+          lutNeedsUpdate = true;
       }
   } else {
       if (globalLastLutArray == nullptr || !env->IsSameObject(lutArray, globalLastLutArray)) {
@@ -860,32 +776,25 @@ Java_com_example_videoprocessingengine_MainActivity_processFrameNativeGPU(
               env->DeleteGlobalRef(globalLastLutArray);
           }
           globalLastLutArray = env->NewGlobalRef(lutArray);
-          lutChanged = true;
+          lutNeedsUpdate = true;
       }
   }
 
-  jfloat *lut = nullptr;
+  // Get the LUT data
+  jfloat *lutPtr = nullptr;
   if (lutArray != nullptr && lutSize > 0) {
-    lut = env->GetFloatArrayElements(lutArray, nullptr);
+    lutPtr = env->GetFloatArrayElements(lutArray, nullptr);
   }
 
-  ANativeWindow* window = nullptr;
-  if (surface != nullptr) {
-      window = ANativeWindow_fromSurface(env, surface);
-  }
+  // HAND OFF TO THE GPU PROCESSOR
+  GPUProcessor::getInstance().process(inPtr, outPtr, width, height, rowStride,
+                                      lutPtr, lutSize, lutNeedsUpdate, surface, env);
 
-  GPUProcessor::getInstance().process(inData, outData, width, height, rowStride,
-                                      lut, lutSize, lutChanged, window);
-
-  if (window != nullptr) {
-      ANativeWindow_release(window);
-  }
-
-  if (lut != nullptr) {
-    env->ReleaseFloatArrayElements(lutArray, lut, JNI_ABORT);
+  // Clean up JNI references
+  if (lutPtr != nullptr) {
+    env->ReleaseFloatArrayElements(lutArray, lutPtr, JNI_ABORT);
   }
 
   auto end = std::chrono::high_resolution_clock::now();
-  return static_cast<jdouble>(
-      std::chrono::duration<double, std::milli>(end - start).count());
+  return static_cast<jdouble>(std::chrono::duration<double, std::milli>(end - start).count());
 }

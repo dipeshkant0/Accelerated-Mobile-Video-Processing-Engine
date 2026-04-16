@@ -49,3 +49,7 @@ target_link_libraries(
         ${vulkan-lib}
         android # Required for native hardware buffer access
 )
+
+# 16 KB page size compatibility for Android 15+ devices
+# This aligns ELF segments to 16 KB boundaries
+target_link_options(videoprocessingengine PRIVATE "-Wl,-z,max-page-size=16384")
