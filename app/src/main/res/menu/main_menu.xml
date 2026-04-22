@@ -46,6 +46,12 @@
             <item
             android:id="@+id/black_white"
             android:title="Black and White" />
+            <item
+                android:id="@+id/night_vision"
+                android:title="Night Vision" />
+            <item
+                android:id="@+id/thermal"
+                android:title="Thermal" />
         </group>
     </menu>
 </item>

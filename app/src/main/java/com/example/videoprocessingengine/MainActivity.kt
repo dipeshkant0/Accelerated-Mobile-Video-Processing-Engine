@@ -48,33 +48,26 @@ class MainActivity : AppCompatActivity() {
     private var latencyFrameCount = 0
     private var displayLatency = 0.0
     
-    // Variables for my Hybrid mode logic
-    private var batteryPercent = 100
-    private var lastLatencyValue = 0.0
-
-    // Dynamic Calibration Variables
-    private enum class CalibrationState { IDLE, PROFILING_BASELINE, PROFILING_SIMD, PROFILING_GPU, READY }
-    private var calibrationState = CalibrationState.IDLE
-    private var profilingFrameCounter = 0
-    private val FRAMES_PER_MODE = 15
-    private val WARMUP_FRAMES = 5 // Skip first few frames for cache/thermal stability
-    private var avgBaselineLatency = 0.0
-    private var avgSimdLatency = 0.0
-    private var avgGpuLatency = 0.0
+    private var batPct = 100
+    private var lastLat = 0.0
 
     enum class ProcessingMode { BASELINE, SIMD, GPU, HYBRID }
-    private var currentMode = ProcessingMode.BASELINE
+    private var curMode = ProcessingMode.BASELINE
 
-    private var tealOrangeLUT: FloatArray? = null
-    private var blackWhiteLUT: FloatArray? = null
-    private var lutSizeteal: Int = 0
-    private var lutSizebw: Int = 0
-    private var currentLUT: FloatArray? = null
-    private var lutSize: Int = 0
-    private var targetWidth = 1280
-    private var targetHeight = 720
-    private lateinit var cameraExecutor: ExecutorService
-    private var displaySurface: Surface? = null
+    private var lutTeal: FloatArray? = null
+    private var lutBW: FloatArray? = null
+    private var lutNight: FloatArray? = null
+    private var lutThermal: FloatArray? = null
+    private var sTeal: Int = 0
+    private var sBW: Int = 0
+    private var sNight: Int = 0
+    private var sThermal: Int = 0
+    private var lutArr: FloatArray? = null
+    private var lSize: Int = 0
+    private var tW = 1280
+    private var tH = 720
+    private lateinit var camExec: ExecutorService
+    private var surf: Surface? = null
 
     // frame processing function in c++
     external fun processFrameNative(inRgba: ByteBuffer, outRgbaBuf: ByteBuffer, width: Int, height: Int, rowStride: Int, currentLUT: FloatArray?, lutSize: Int): Double
@@ -91,7 +84,7 @@ class MainActivity : AppCompatActivity() {
             val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
             val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
             if (level != -1 && scale != -1) {
-                batteryPercent = (level * 100 / scale.toFloat()).toInt()
+                batPct = (level * 100 / scale.toFloat()).toInt()
             }
         }
     }
@@ -99,7 +92,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         unregisterReceiver(batteryReceiver)
-        cameraExecutor.shutdown()
+        camExec.shutdown()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -112,25 +105,48 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-        registerReceiver(batteryReceiver, filter)
+        val batteryStatus = registerReceiver(batteryReceiver, filter)
+        
+        // Initialize values from the current battery status
+        batteryStatus?.let { intent ->
+            val temp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0)
+            tempInCelsius = temp / 10.0
+            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+            if (level != -1 && scale != -1) {
+                batPct = (level * 100 / scale.toFloat()).toInt()
+            }
+        }
 
         // Preload all available LUTs exactly once when the app opens
         val bwLutData = LutParser.parseCubeFile(this, "LUTs/BlackAndWhiteLUT.cube")
         if (bwLutData != null) {
-            blackWhiteLUT = bwLutData.data
-            lutSizebw = bwLutData.size
+            lutBW = bwLutData.data
+            sBW = bwLutData.size
         }
 
         val tealOrangeLutData = LutParser.parseCubeFile(this, "LUTs/TealOrangeLUT.cube")
         if (tealOrangeLutData != null) {
-            tealOrangeLUT = tealOrangeLutData.data
-            lutSizeteal = tealOrangeLutData.size
+            lutTeal = tealOrangeLutData.data
+            sTeal = tealOrangeLutData.size
+        }
+
+        val nightVisionLutData = LutParser.parseCubeFile(this, "LUTs/Night Vision.cube")
+        if (nightVisionLutData != null) {
+            lutNight = nightVisionLutData.data
+            sNight = nightVisionLutData.size
+        }
+
+        val thermalLutData = LutParser.parseCubeFile(this, "LUTs/Thermal.cube")
+        if (thermalLutData != null) {
+            lutThermal = thermalLutData.data
+            sThermal = thermalLutData.size
         }
 
         // Set the default LUT
-        currentLUT = null
+        lutArr = null
 
-        cameraExecutor = Executors.newSingleThreadExecutor()
+        camExec = Executors.newSingleThreadExecutor()
 
         if (allPermissionsGranted()) {
             startCamera()
@@ -140,14 +156,14 @@ class MainActivity : AppCompatActivity() {
 
         binding.gpuTextureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-                displaySurface = Surface(st)
+                surf = Surface(st)
             }
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
-                displaySurface = Surface(st)
+                surf = Surface(st)
             }
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                displaySurface?.release()
-                displaySurface = null
+                surf?.release()
+                surf = null
                 return true
             }
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
@@ -164,39 +180,46 @@ class MainActivity : AppCompatActivity() {
 
         when (item.itemId) {
             R.id.mode_baseline -> {
-                currentMode = ProcessingMode.BASELINE
+                curMode = ProcessingMode.BASELINE
             }
             R.id.mode_simd -> {
-                currentMode = ProcessingMode.SIMD
+                curMode = ProcessingMode.SIMD
             }
             R.id.mode_gpu -> {
-                currentMode = ProcessingMode.GPU
+                curMode = ProcessingMode.GPU
             }
             R.id.mode_hybrid -> {
-                currentMode = ProcessingMode.HYBRID
-                calibrationState = CalibrationState.IDLE
+                curMode = ProcessingMode.HYBRID
             }
             R.id.res_720p -> {
-                targetWidth = 1280
-                targetHeight = 720
+                tW = 1280
+                tH = 720
                 restartCamera()
             }
             R.id.res_1080p -> {
-                targetWidth = 1920
-                targetHeight = 1080
+                tW = 1920
+                tH = 1080
                 restartCamera()
             }
             R.id.teal_orange -> {
-                currentLUT = tealOrangeLUT
-                lutSize = lutSizeteal
+                lutArr = lutTeal
+                lSize = sTeal
             }
             R.id.black_white -> {
-                currentLUT = blackWhiteLUT
-                lutSize = lutSizebw
+                lutArr = lutBW
+                lSize = sBW
+            }
+            R.id.night_vision -> {
+                lutArr = lutNight
+                lSize = sNight
+            }
+            R.id.thermal -> {
+                lutArr = lutThermal
+                lSize = sThermal
             }
             R.id.no_lut -> {
-                currentLUT = null
-                lutSize = 0
+                lutArr = null
+                lSize = 0
             }
         }
         return true
@@ -219,17 +242,15 @@ class MainActivity : AppCompatActivity() {
                     ResolutionSelector.Builder()
                         .setResolutionStrategy(
                             ResolutionStrategy(
-                                Size(targetWidth, targetHeight),
+                                Size(tW, tH),
                                 ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                             )
                         ).build()
                 ).build()
-            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
+            imageAnalysis.setAnalyzer(camExec) { imageProxy ->
                 val width = imageProxy.width
                 val height = imageProxy.height
 
-                // 1. Battery Temperature is now updated via BroadcastReceiver
-                
                 val currentTimestamp = System.currentTimeMillis()
                 val currentCpuTime = android.os.Debug.threadCpuTimeNanos()
 
@@ -241,10 +262,8 @@ class MainActivity : AppCompatActivity() {
 
                 if (currentTimestamp - lastFrameTimestamp >= 1000) {
                     val timeInterval = currentTimestamp - lastFrameTimestamp
-
                     fps = (frameCount * 1000.0) / timeInterval
 
-                    // Average the latency over the frames processed in the last second
                     if (latencyFrameCount > 0) {
                         displayLatency = totalLatencyOverInterval / latencyFrameCount
                     }
@@ -255,7 +274,6 @@ class MainActivity : AppCompatActivity() {
                     val realDiff = timeInterval * 1_000_000L
                     cpuUsage = (cpuDiff.toDouble() / realDiff.toDouble()) * 100.0
 
-                    // Fetch Memory data
                     val memInfo = android.app.ActivityManager.MemoryInfo()
                     val actManager = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
                     actManager.getMemoryInfo(memInfo)
@@ -269,130 +287,29 @@ class MainActivity : AppCompatActivity() {
                     lastRealTime = currentTimestamp
                 }
 
-
-                // Initialize memory for the frame if it doesn't exist yet
                 if (rgbaBuffer == null || rgbaBuffer!!.capacity() < width * height * 4) {
                     rgbaBuffer = ByteBuffer.allocateDirect(width * height * 4)
                 }
 
-                // Decide which mode to use if we are in Hybrid mode
-                var modeToUseRightNow = currentMode
-                if (currentMode == ProcessingMode.HYBRID) {
-                    when (calibrationState) {
-                        CalibrationState.IDLE -> {
-                            calibrationState = CalibrationState.PROFILING_BASELINE
-                            profilingFrameCounter = 0
-                            avgBaselineLatency = 0.0
-                            modeToUseRightNow = ProcessingMode.BASELINE
-                        }
-                        CalibrationState.PROFILING_BASELINE -> {
-                            modeToUseRightNow = ProcessingMode.BASELINE
-                            profilingFrameCounter++
-                            // Skip the first few frames (warm-up)
-                            if (profilingFrameCounter > WARMUP_FRAMES) {
-                                avgBaselineLatency += lastLatencyValue
-                                // If we've collected enough stable frames
-                                if (profilingFrameCounter >= (WARMUP_FRAMES + FRAMES_PER_MODE)) {
-                                    avgBaselineLatency /= FRAMES_PER_MODE
-                                    calibrationState = CalibrationState.PROFILING_SIMD
-                                    profilingFrameCounter = 0
-                                    avgSimdLatency = 0.0
-                                }
-                            }
-                        }
-                        CalibrationState.PROFILING_SIMD -> {
-                            modeToUseRightNow = ProcessingMode.SIMD
-                            profilingFrameCounter++
-                            if (profilingFrameCounter > WARMUP_FRAMES) {
-                                avgSimdLatency += lastLatencyValue
-                                if (profilingFrameCounter >= (WARMUP_FRAMES + FRAMES_PER_MODE)) {
-                                    avgSimdLatency /= FRAMES_PER_MODE
-                                    calibrationState = CalibrationState.PROFILING_GPU
-                                    profilingFrameCounter = 0
-                                    avgGpuLatency = 0.0
-                                }
-                            }
-                        }
-                        CalibrationState.PROFILING_GPU -> {
-                            modeToUseRightNow = ProcessingMode.GPU
-                            profilingFrameCounter++
-                            if (profilingFrameCounter > WARMUP_FRAMES) {
-                                avgGpuLatency += lastLatencyValue
-                                if (profilingFrameCounter >= (WARMUP_FRAMES + FRAMES_PER_MODE)) {
-                                    avgGpuLatency /= FRAMES_PER_MODE
-                                    calibrationState = CalibrationState.READY
-                                    profilingFrameCounter = 0
-                                }
-                            }
-                        }
-                        CalibrationState.READY -> {
-                            // PERFORMANCE-FIRST HYBRID LOGIC (Restored)
-                            
-                            // 1. Thermal Emergency (over 40 degrees) - Use the calibrated "Safe Mode"
-                            if (tempInCelsius > 40.0) {
-                                modeToUseRightNow = ProcessingMode.BASELINE
-                            }
-                            // 2. Battery Low - Use the calibrated "Efficient Mode" (SIMD on your phone)
-                            else if (batteryPercent < 20) {
-                                modeToUseRightNow = ProcessingMode.SIMD
-                            }
-                            // 3. Performance Check - If latency > 15% slower than the GPU benchmark
-                            else if (lastLatencyValue > (avgGpuLatency * 1.15)) {
-                                // If GPU is slowing down (thermal throttling?), fall back to SIMD
-                                modeToUseRightNow = ProcessingMode.SIMD
-                            }
-                            // 4. Default - Use the winner from our benchmark (GPU on your phone)
-                            else {
-                                modeToUseRightNow = if (avgGpuLatency < avgSimdLatency) 
-                                    ProcessingMode.GPU else ProcessingMode.SIMD
-                            }
-                        }
-                    }
+                var mode = curMode
+                if (curMode == ProcessingMode.HYBRID) {
+                    // Switch to SIMD if temperature > 40C or battery < 15% to save power and reduce heat
+                    mode = if (tempInCelsius < 40.0 && batPct > 15) ProcessingMode.GPU else ProcessingMode.SIMD
                 }
 
-                // Send the frame to C++ based on the selected mode
-                val latency = when (modeToUseRightNow) {
-                    ProcessingMode.SIMD -> processFrameNativeSIMD(
-                        imageProxy.planes[0].buffer,
-                        rgbaBuffer!!,
-                        width,
-                        height,
-                        imageProxy.planes[0].rowStride,
-                        currentLUT,
-                        lutSize
-                    )
-                    ProcessingMode.GPU -> processFrameNativeGPU(
-                        imageProxy.planes[0].buffer,
-                        rgbaBuffer!!,
-                        width,
-                        height,
-                        imageProxy.planes[0].rowStride,
-                        currentLUT,
-                        lutSize,
-                        displaySurface
-                    )
-                    else -> processFrameNative(
-                        imageProxy.planes[0].buffer,
-                        rgbaBuffer!!,
-                        width,
-                        height,
-                        imageProxy.planes[0].rowStride,
-                        currentLUT,
-                        lutSize
-                    )
+                val lat = when (mode) {
+                    ProcessingMode.SIMD -> processFrameNativeSIMD(imageProxy.planes[0].buffer, rgbaBuffer!!, width, height, imageProxy.planes[0].rowStride, lutArr, lSize)
+                    ProcessingMode.GPU -> processFrameNativeGPU(imageProxy.planes[0].buffer, rgbaBuffer!!, width, height, imageProxy.planes[0].rowStride, lutArr, lSize, surf)
+                    else -> processFrameNative(imageProxy.planes[0].buffer, rgbaBuffer!!, width, height, imageProxy.planes[0].rowStride, lutArr, lSize)
                 }
                 
-                // Save the latency so we can use it for the next frame in Hybrid mode
-                lastLatencyValue = latency
-
-                // Accumulate latency over the interval
-                totalLatencyOverInterval += latency
+                lastLat = lat
+                totalLatencyOverInterval += lat
                 latencyFrameCount++
 
                 rgbaBuffer!!.rewind()
 
-                if (modeToUseRightNow != ProcessingMode.GPU) {
-                    // Convert the raw returned buffer into a Bitmap so the screen can show it
+                if (mode != ProcessingMode.GPU) {
                     if (reusableBitmap == null || reusableBitmap!!.width != width || reusableBitmap!!.height != height) {
                         reusableBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                     }
@@ -400,14 +317,12 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 runOnUiThread {
-                    if (modeToUseRightNow == ProcessingMode.GPU) {
+                    if (mode == ProcessingMode.GPU) {
                         binding.gpuTextureView.visibility = android.view.View.VISIBLE
                         binding.processedImageView.visibility = android.view.View.GONE
                     } else {
                         binding.gpuTextureView.visibility = android.view.View.GONE
                         binding.processedImageView.visibility = android.view.View.VISIBLE
-
-                        // Rotate the bitmap for portrait display
                         val matrix = Matrix()
                         matrix.postRotate(90f)
                         val rotatedBitmap = Bitmap.createBitmap(reusableBitmap!!, 0, 0, width, height, matrix, false)
@@ -415,18 +330,8 @@ class MainActivity : AppCompatActivity() {
                     }
                     frameCount++
                     
-                    // Show the mode name, and if it is Hybrid, show what it is actually doing
-                    val modeDisplayName = if (currentMode == ProcessingMode.HYBRID) {
-                        when (calibrationState) {
-                            CalibrationState.READY -> "HYBRID (READY: ${modeToUseRightNow.name})"
-                            CalibrationState.IDLE -> "HYBRID (PREPARING...)"
-                            else -> "HYBRID (PROFILING ${modeToUseRightNow.name}...)"
-                        }
-                    } else {
-                        currentMode.name
-                    }
-                    
-                    binding.modeLabel.text = "MODE: $modeDisplayName | RES: ${targetHeight}p"
+                    val name = if (curMode == ProcessingMode.HYBRID) "HYBRID (${mode.name})" else curMode.name
+                    binding.modeLabel.text = "MODE: $name | RES: ${tH}p"
                     binding.latencyVal.text = String.format("LAT: %.1f ms", displayLatency)
                     binding.fpsVal.text = String.format("FPS: %.1f", fps)
                     binding.cpuVal.text = String.format("CPU: %.0f%%", cpuUsage)
