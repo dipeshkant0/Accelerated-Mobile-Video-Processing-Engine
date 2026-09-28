@@ -38,12 +38,18 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 # Find the standard Android logging and graphics libraries
 find_library(log-lib log)
 find_library(gles-lib GLESv3)  # For OpenGL ES 3.2 Compute Shaders
+find_library(egl-lib EGL)     # For OpenGL context management
 find_library(vulkan-lib vulkan) # For Vulkan mode
 
 target_link_libraries(
         videoprocessingengine # This matches your project name
         ${log-lib}
         ${gles-lib}
+        ${egl-lib}
         ${vulkan-lib}
         android # Required for native hardware buffer access
 )
+
+# 16 KB page size compatibility for Android 15+ devices
+# This aligns ELF segments to 16 KB boundaries
+target_link_options(videoprocessingengine PRIVATE "-Wl,-z,max-page-size=16384")

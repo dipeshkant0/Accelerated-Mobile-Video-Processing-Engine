@@ -12,6 +12,9 @@
             <item
                 android:id="@+id/mode_gpu"
                 android:title="GPU (OpenCL)" />
+            <item
+                android:id="@+id/mode_hybrid"
+                android:title="Hybrid (CPU+GPU)" />
         </group>
     </menu>
 </item>
@@ -35,14 +38,20 @@
         <group android:id="@+id/lut_group" android:checkableBehavior="single">
             <item
                 android:id="@+id/no_lut"
-                android:title="None" />
+                android:title="None"
+                android:checked="true" />
             <item
                 android:id="@+id/teal_orange"
-                android:title="Teal Orange"
-                android:checked="true" />
+                android:title="Teal Orange" />
             <item
             android:id="@+id/black_white"
             android:title="Black and White" />
+            <item
+                android:id="@+id/night_vision"
+                android:title="Night Vision" />
+            <item
+                android:id="@+id/thermal"
+                android:title="Thermal" />
         </group>
     </menu>
 </item>
